@@ -4,7 +4,7 @@
 //! in-process: branch, pinned SHA, depth, credentials, and the
 //! unavailable-commit failure must behave the same either way.
 //!
-//! Live test: requires `DAYTONA_API_KEY`; skipped otherwise.
+//! Live test: requires `DAYTONA_API_KEY`; run with `mise run test:live`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -205,11 +205,9 @@ async fn clone_contract(sandbox: &dyn Sandbox, transport: &str) -> Result<(), St
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn git_clone_selects_the_same_implementation_on_both_transports() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        // No credentials; nothing to verify.
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
 
     let in_process = DaytonaProvider::connect()

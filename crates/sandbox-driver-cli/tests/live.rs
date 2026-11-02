@@ -1,8 +1,9 @@
 //! Live black-box workflows for the `lithos-sandbox` binary.
 //!
-//! Docker runs only when its daemon is reachable. Daytona runs when credentials
-//! are present in the process environment or the workspace `.env` file. Every
-//! created sandbox has a unique label and a cleanup guard.
+//! Docker runs only when its daemon is reachable. Daytona is ignored by
+//! default; `mise run test:live` runs it with credentials from the process
+//! environment or the workspace `.env` file. Every created sandbox has a
+//! unique label and a cleanup guard.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -45,15 +46,13 @@ fn docker_cli_workflow() {
 }
 
 #[test]
+#[ignore = "requires Daytona credentials; run with `mise run test:live`"]
 fn daytona_cli_workflow() {
     let cli = CliRunner::new();
-    if !cli.has_daytona_credentials() {
-        assert!(
-            !live_providers_required(),
-            "Daytona is required, but no API key or JWT token is available"
-        );
-        return;
-    }
+    assert!(
+        cli.has_daytona_credentials(),
+        "Daytona is required, but no API key or JWT token is available"
+    );
 
     assert_provider_contract(&cli, "daytona", "vm");
     let source = ["--snapshot", TEST_SNAPSHOT, "--kind", "container"];
