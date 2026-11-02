@@ -75,6 +75,9 @@ struct Client {
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
     closed: AtomicBool,
+    /// Set once the plugin was asked to shut down, so the transport closing
+    /// afterwards is the expected end of the session rather than a failure.
+    shutdown_requested: AtomicBool,
     closed_signal: CancellationToken,
     cleanup: Mutex<JoinSet<()>>,
     failed_cleanup: Mutex<Vec<(Arc<OwnedSemaphorePermit>, TransportError)>>,
@@ -133,6 +136,7 @@ impl Client {
             stop_acknowledgments: AtomicU64::new(0),
             max_stop_acknowledgment_us: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
             closed_signal: CancellationToken::new(),
             cleanup: Mutex::new(JoinSet::new()),
             failed_cleanup: Mutex::new(Vec::new()),
@@ -257,7 +261,11 @@ impl Client {
             closed_error.get_or_insert(error).clone()
         };
         if first_failure {
-            tracing::error!(error = ?error, "plugin transport failed");
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                tracing::debug!(error = ?error, "plugin transport closed after shutdown");
+            } else {
+                tracing::error!(error = ?error, "plugin transport failed");
+            }
         }
         let pending: Vec<_> = {
             let mut pending = self.pending.lock().expect("pending lock");
@@ -506,10 +514,12 @@ impl Client {
         Ok(())
     }
 
+    // The caller receives the error and decides whether it is a failure: a
+    // missing file is often the answer it asked for.
     #[tracing::instrument(
         skip_all,
         fields(method = method, request_id = field::Empty),
-        err
+        err(level = "debug")
     )]
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
         let priority = m::traits(method).reserved;

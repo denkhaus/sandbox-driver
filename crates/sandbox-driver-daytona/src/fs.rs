@@ -66,12 +66,14 @@ fn parse_mode(mode: &str) -> Option<u32> {
     Some(value)
 }
 
+// Errors log at DEBUG: each one is returned to the caller, which decides
+// whether it is a failure. A missing file is often the answer it asked for.
 #[async_trait]
 impl Filesystem for DaytonaFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
-        err
+        err(level = "debug")
     )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let mut buffer = BoundedBuffer::new(DEFAULT_BUFFER_BYTES);
@@ -139,7 +141,7 @@ impl Filesystem for DaytonaFs {
             sandbox_id = %self.sandbox_id,
             byte_count = content.len()
         ),
-        err
+        err(level = "debug")
     )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         if content.len() > DEFAULT_BUFFER_BYTES {
@@ -175,7 +177,7 @@ impl Filesystem for DaytonaFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, recursive),
-        err
+        err(level = "debug")
     )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         match self
@@ -190,7 +192,7 @@ impl Filesystem for DaytonaFs {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn exists(&self, path: &str) -> Result<bool> {
         match self
             .service()
@@ -207,7 +209,7 @@ impl Filesystem for DaytonaFs {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let info = self
             .service()
@@ -242,7 +244,7 @@ impl Filesystem for DaytonaFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, depth),
-        err
+        err(level = "debug")
     )]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         let depth = i32::try_from(depth.max(1)).unwrap_or(i32::MAX);
@@ -271,7 +273,7 @@ impl Filesystem for DaytonaFs {
         Ok(entries)
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn create_dir(&self, path: &str) -> Result<()> {
         self.service()
             .await?
@@ -280,7 +282,7 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("creating directory", error))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.service()
             .await?
@@ -292,7 +294,7 @@ impl Filesystem for DaytonaFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, mode),
-        err
+        err(level = "debug")
     )]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
         let options = SetFilePermissionsOptions {
@@ -307,7 +309,7 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("setting permissions", error))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let mut input = tokio_fs::File::open(local)
             .await
@@ -320,7 +322,7 @@ impl Filesystem for DaytonaFs {
         self.write_from(remote, &mut input, length).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err(level = "debug"))]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         if let Some(parent) = local.parent() {
             tokio_fs::create_dir_all(parent)
