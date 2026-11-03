@@ -15,6 +15,13 @@ primary's `sh.sandbox-driver.fence-name` label records
 that claim name for subsequent clients. Older sandboxes without this label use
 the canonical container ID to identify their claim.
 
+Lifecycle and admission claims also record the primary's Docker name in
+`sh.sandbox-driver.fence-sandbox-name`. If the primary disappears before claim
+release, retries by name, full ID, or short ID still report `busy`. Discovery
+lists claims and matches their preserved identities; unrelated names remain
+absent. Claims created by older versions without the name label must be
+reconciled using their recorded identifier when the primary is already gone.
+
 An admitted exec releases its claim after Docker starts the attached execution;
 the command itself can then run concurrently with other commands. One-shots
 release admission after their container has started and carry the sandbox ID

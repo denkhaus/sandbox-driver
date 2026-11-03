@@ -2,9 +2,9 @@
 //! `cargo test -p sandbox-driver-docker --test fence -- --ignored`.
 
 use std::collections::HashMap;
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{iter, process};
 
 use bollard::Docker;
 use bollard::container::{
@@ -20,7 +20,11 @@ use tokio::time::{sleep, timeout};
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 
 fn assert_busy<T>(result: sandbox_driver::Result<T>) {
-    assert!(matches!(result, Err(Error::Provider(error)) if error.code.as_deref() == Some("busy")));
+    assert!(
+        matches!(&result, Err(Error::Provider(error)) if error.code.as_deref() == Some("busy")),
+        "expected busy, got {:?}",
+        result.err()
+    );
 }
 
 async fn labeled(docker: &Docker, label: &str, id: &str) -> Vec<String> {
@@ -131,11 +135,13 @@ async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
     let provider = DockerProvider::connect().await.expect("Docker is required");
     let other = DockerProvider::connect().await.expect("second provider");
     let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let name = format!("fence-cancelled-{}", process::id());
     let sandbox = provider
         .create(
             &SandboxSpec::new(SandboxSource::Image {
                 reference: IMAGE.to_owned(),
-            }),
+            })
+            .name(&name),
             None,
         )
         .await
@@ -155,7 +161,32 @@ async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
     // longer execute. The cancelled request only stops resources; it cannot
     // recreate them. Do not infer safety from an elapsed lease timeout.
     let markers = labeled(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await;
-    for container in iter::once(sandbox.id().as_str().to_owned()).chain(markers) {
+    docker
+        .remove_container(
+            sandbox.id().as_str(),
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove test primary");
+    // The retained claim must still be found when Docker can no longer
+    // resolve the original name or short ID through the primary container.
+    let mut retries = Vec::new();
+    for alias in [sandbox.id().as_str(), &sandbox.id().as_str()[..12], &name] {
+        retries.push(
+            other
+                .delete(
+                    &sandbox_driver::SandboxId::try_new(alias).expect("alias"),
+                    None,
+                )
+                .await,
+        );
+    }
+    let retained = labeled(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await;
+    for container in markers {
         docker
             .remove_container(
                 &container,
@@ -169,6 +200,20 @@ async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
             .expect("remove test primary and markers");
     }
     sandbox.delete().await.expect("cleanup");
+    assert!(
+        !retained.is_empty(),
+        "retry must not release retained ownership"
+    );
+    for retry in retries {
+        assert_busy(retry);
+    }
+    other
+        .delete(
+            &sandbox_driver::SandboxId::try_new(name).expect("name"),
+            None,
+        )
+        .await
+        .expect("delete by name after reconciliation");
 }
 
 #[tokio::test(flavor = "multi_thread")]

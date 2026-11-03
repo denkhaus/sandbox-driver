@@ -34,6 +34,7 @@ use crate::sidecars::NETWORK_LABEL;
 pub(crate) const FENCE_NAME_LABEL: &str = "sh.sandbox-driver.fence-name";
 pub(crate) const FENCE_LABEL: &str = "sh.sandbox-driver.fence";
 const OPERATION_LABEL: &str = "sh.sandbox-driver.fence-operation";
+const SANDBOX_NAME_LABEL: &str = "sh.sandbox-driver.fence-sandbox-name";
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_ADMISSION_POLL: Duration = Duration::from_millis(200);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -151,10 +152,17 @@ async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Opti
         .ok_or_else(|| Error::Transport(TransportError::new("daemon omitted the sandbox image")))?;
     let name = label_of(&inspect, FENCE_NAME_LABEL)
         .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned);
+    // Keep the name on the claim: the primary may disappear before release,
+    // after which Docker can no longer resolve that name to its canonical ID.
+    let sandbox_name = inspect
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start_matches('/');
     let deadline = Instant::now() + ADMISSION_WAIT;
     let mut poll = Duration::from_millis(10);
     loop {
-        match create_marker(docker, image, &name, id, operation).await {
+        match create_marker(docker, image, &name, id, sandbox_name, operation).await {
             Ok(Err(error)) if is_conflict(&error) => {
                 // Short concurrent admissions can queue, preserving concurrent
                 // exec callers. Lifecycle ownership is always a Busy refusal.
@@ -209,7 +217,7 @@ pub(crate) fn create<'a, T: Send + 'a>(
 ) -> BoxFuture<'a, Result<T>> {
     // Boxed for the same reason as `run`.
     Box::pin(async move {
-        let attempt = create_marker(docker, image, name, sandbox, Operation::Create).await;
+        let attempt = create_marker(docker, image, name, sandbox, sandbox, Operation::Create).await;
         let marker = claimed(name, attempt)?;
         finish(docker, &marker, Operation::Create, work).await
     })
@@ -222,6 +230,7 @@ async fn create_marker(
     image: &str,
     name: &str,
     id: &str,
+    sandbox_name: &str,
     operation: Operation,
 ) -> MarkerAttempt {
     timeout(
@@ -236,6 +245,7 @@ async fn create_marker(
                 entrypoint: Some(vec!["/bin/false".to_owned()]),
                 labels: Some(HashMap::from([
                     (FENCE_LABEL.to_owned(), id.to_owned()),
+                    (SANDBOX_NAME_LABEL.to_owned(), sandbox_name.to_owned()),
                     (MANAGED_LABEL.to_owned(), "false".to_owned()),
                     (OPERATION_LABEL.to_owned(), operation.label().to_owned()),
                     // Image labels are merged by Docker. A claim must never
@@ -276,17 +286,36 @@ async fn ensure_absent(docker: &Docker, id: &str) -> Result<()> {
         OPERATION_TIMEOUT,
         docker.list_containers(Some(ListContainersOptions {
             all: true,
-            filters: HashMap::from([("label".to_owned(), vec![format!("{FENCE_LABEL}={id}")])]),
+            // Short IDs cannot be matched by a Docker label-equality filter.
+            // Inspect only claims, then match their preserved identities.
+            filters: HashMap::from([("label".to_owned(), vec![FENCE_LABEL.to_owned()])]),
             ..Default::default()
         })),
     )
     .await
     .map_err(|_| acquisition_timeout(id))?
     .map_err(|error| docker_error("discovering sandbox fence", error))?;
-    if markers.is_empty() {
-        Ok(())
-    } else {
+    let owns_identifier = markers.iter().any(|marker| {
+        let Some(labels) = &marker.labels else {
+            return false;
+        };
+        let owner = labels
+            .get(FENCE_LABEL)
+            .map(String::as_str)
+            .unwrap_or_default();
+        owner == id
+            || labels
+                .get(SANDBOX_NAME_LABEL)
+                .is_some_and(|name| name == id)
+            || (owner.len() == 64
+                && owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !id.is_empty()
+                && owner.starts_with(id))
+    });
+    if owns_identifier {
         Err(busy("another operation owns the sandbox fence"))
+    } else {
+        Ok(())
     }
 }
 

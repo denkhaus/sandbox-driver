@@ -596,7 +596,10 @@ async fn absent_primary_does_not_hide_retained_ownership() {
         if request.contains("/containers/main/json") {
             (404, json!({"message": "primary removed"}))
         } else if request.contains("/containers/json?") && request.contains("fence") {
-            (200, json!([{"Id": "retained-fence"}]))
+            (
+                200,
+                json!([{"Id": "retained-fence", "Labels": {"sh.sandbox-driver.fence": "main"}}]),
+            )
         } else {
             panic!("unexpected request: {request}");
         }
@@ -608,6 +611,85 @@ async fn absent_primary_does_not_hide_retained_ownership() {
         .await
         .expect_err("ownership remains");
     assert!(matches!(error, Error::Provider(error) if error.code.as_deref() == Some("busy")));
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn failed_delete_release_remains_busy_by_name_and_short_id() {
+    const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let removed = AtomicBool::new(false);
+    let claim_labels = Arc::new(Mutex::new(Value::Null));
+    let labels = Arc::clone(&claim_labels);
+    let daemon = Daemon::with_manual_release(move |request| {
+        if request.starts_with("GET ") && request.contains("/json ") {
+            if removed.load(Ordering::SeqCst) {
+                return (404, json!({"message": "primary removed"}));
+            }
+            let mut primary = inspect(true);
+            primary["Id"] = json!(ID);
+            primary["Name"] = json!("/example");
+            primary["HostConfig"]["NetworkMode"] = json!("default");
+            return (200, primary);
+        }
+        if request.starts_with("DELETE ") && request.contains(&format!("/containers/{ID}?")) {
+            removed.store(true, Ordering::SeqCst);
+            return (204, Value::Null);
+        }
+        if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
+            return (500, json!({"message": "injected fence release failure"}));
+        }
+        if request.contains("/containers/json?") {
+            if request.contains("fence") {
+                // Honor both label-presence discovery and the old exact-ID
+                // query, so the regression fails with the original lookup.
+                let labels = labels.lock().unwrap();
+                let owner = labels["sh.sandbox-driver.fence"].as_str().unwrap();
+                if !request.contains("fence%3D") || request.contains(&format!("fence%3D{owner}%22"))
+                {
+                    return (200, json!([{"Id": "fence", "Labels": *labels}]));
+                }
+            }
+            return (200, json!([]));
+        }
+        panic!("unexpected request: {request}");
+    })
+    .await;
+    let result = daemon
+        .provider
+        .delete(&SandboxId::try_new("example").unwrap(), None)
+        .await;
+    assert!(
+        matches!(result, Err(Error::Provider(error)) if error.code.as_deref() == Some("transport"))
+    );
+    // Discover the actual claim metadata emitted by the provider, rather than
+    // hard-coding the new name label into the simulated daemon's response.
+    {
+        let requests = daemon.requests.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.contains("/containers/create?name=sandbox-driver-fence-"))
+            .unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let claim: Value = serde_json::from_str(body).unwrap();
+        *claim_labels.lock().unwrap() = claim["Labels"].clone();
+    }
+    for alias in [ID, &ID[..12], "example"] {
+        let result = daemon
+            .provider
+            .delete(&SandboxId::try_new(alias).unwrap(), None)
+            .await;
+        assert!(
+            matches!(result, Err(Error::Provider(error)) if error.code.as_deref() == Some("busy")),
+            "retained ownership was missed for {alias}"
+        );
+    }
+    for unrelated in ["exam", "another-sandbox", "bbbbbbbbbbbb"] {
+        daemon
+            .provider
+            .delete(&SandboxId::try_new(unrelated).unwrap(), None)
+            .await
+            .expect("unrelated names remain absent");
+    }
     daemon.finish().await;
 }
 
