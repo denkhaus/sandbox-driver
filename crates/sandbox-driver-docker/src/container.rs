@@ -78,12 +78,9 @@ impl ContainerRef {
         options: CreateExecOptions<String>,
         what: &str,
     ) -> Result<AttachedExec> {
-        fence::run(
-            &self.docker,
-            &self.id,
-            Operation::Admit,
-            self.start_control(options, what),
-        )
+        fence::run(&self.docker, &self.id, Operation::Admit, async {
+            Ok(self.start_control(options, what).await?)
+        })
         .await
     }
 
@@ -179,11 +176,11 @@ pub(crate) async fn remove_container_forced(
 
 /// A stop response is not enough when the subsequent state still permits
 /// execution. Missing state is also unconfirmed, never a successful fence.
-pub(crate) async fn confirm_stopped(docker: &Docker, id: &str) -> Result<()> {
+pub(crate) async fn confirm_stopped(docker: &Docker, id: &str) -> fence::WorkResult<()> {
     let inspect = match inspect_container(docker, id).await {
         Ok(inspect) => inspect,
         Err(Error::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     if inspect
         .state
@@ -198,7 +195,7 @@ pub(crate) async fn confirm_stopped(docker: &Docker, id: &str) -> Result<()> {
     );
     error.code = Some("fence_leaked".to_owned());
     error.detail = Some(serde_json::json!({"container": id}));
-    Err(Error::Provider(error))
+    Err(fence::Failure::reconcile(Error::Provider(error)))
 }
 
 /// Removes a sandbox's container and everything that depends on it.

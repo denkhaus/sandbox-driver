@@ -385,7 +385,8 @@ impl CreatedContainer {
     /// the primary, so unsuccessful cleanup remains discoverable by
     /// label. Returns the original failure only after confirmed cleanup;
     /// otherwise reports the resources whose removal remains unconfirmed.
-    pub(crate) async fn abandon(self, error: Error) -> Error {
+    pub(crate) async fn abandon(self, error: Error) -> fence::Failure {
+        let failure = fence::Failure::from(error);
         let mut remaining = vec![RemainingResource {
             kind: "container".to_owned(),
             id:   self.id.clone(),
@@ -404,34 +405,32 @@ impl CreatedContainer {
             remove_container_forced(&self.docker, &self.id, "removing failed sandbox").await
         };
         let cleanup_error = match time::timeout(Duration::from_secs(30), cleanup).await {
-            Ok(Ok(())) => return error,
+            Ok(Ok(())) => return failure,
             Ok(Err(error)) => error,
             Err(_) => Error::Transport(TransportError::new("failed-create cleanup timed out")),
         };
-        tracing::warn!(error = %error, cleanup_error = %cleanup_error, "failed-create cleanup incomplete");
-        let projection = ContractError::IncompleteCleanup {
-            message: "failed-create cleanup could not be confirmed".to_owned(),
-            remaining,
-        };
-        let message = format!("{projection} after create failed: {error}");
-        let mut detail = serde_json::to_value(projection).expect("cleanup projection serializes");
-        detail["cause"] =
-            serde_json::to_value(ErrorReport::from(&error)).expect("error report serializes");
-        detail["cleanup_cause"] = serde_json::to_value(ErrorReport::from(&cleanup_error))
-            .expect("cleanup error report serializes");
-        // Either failure can leave work in flight. Keep an uncertain creation
-        // in the source chain even when cleanup returned a definite refusal;
-        // otherwise the fence owner would mistake the combined failure for a
-        // confirmed outcome and release its claim. Both reports remain above.
-        let source = if fence::uncertain(&error) {
-            error
-        } else {
-            cleanup_error
-        };
-        let mut failure = ProviderError::with_source(docker_kind(), message, source);
-        failure.code = Some("incomplete_cleanup".to_owned());
-        failure.detail = Some(detail);
-        Error::Provider(failure)
+        failure.combine_with(cleanup_error.into(), |error, cleanup_error| {
+            tracing::warn!(
+                error = %error,
+                cleanup_error = %cleanup_error,
+                "failed-create cleanup incomplete"
+            );
+            let projection = ContractError::IncompleteCleanup {
+                message: "failed-create cleanup could not be confirmed".to_owned(),
+                remaining,
+            };
+            let message = format!("{projection} after create failed: {error}");
+            let mut detail =
+                serde_json::to_value(projection).expect("cleanup projection serializes");
+            detail["cause"] =
+                serde_json::to_value(ErrorReport::from(&error)).expect("error report serializes");
+            detail["cleanup_cause"] = serde_json::to_value(ErrorReport::from(&cleanup_error))
+                .expect("cleanup error report serializes");
+            let mut failure = ProviderError::with_source(docker_kind(), message, error);
+            failure.code = Some("incomplete_cleanup".to_owned());
+            failure.detail = Some(detail);
+            Error::Provider(failure)
+        })
     }
 }
 

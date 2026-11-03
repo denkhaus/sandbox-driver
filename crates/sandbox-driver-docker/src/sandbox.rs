@@ -61,7 +61,7 @@ impl DockerSandbox {
         &'a self,
         action: Action,
         operation: Operation,
-        work: impl Future<Output = Result<()>> + Send + 'a,
+        work: impl Future<Output = fence::WorkResult<()>> + Send + 'a,
     ) -> impl Future<Output = Result<()>> + 'a {
         // Boxing `work` here keeps it out of every caller's future.
         let fenced = fence::run(&self.container.docker, self.id.as_str(), operation, work);
@@ -154,7 +154,7 @@ impl Sandbox for DockerSandbox {
                     return Err(Error::Provider(ProviderError::new(
                         docker_kind(),
                         "sandbox creation did not finish connecting its services; delete the incomplete sandbox",
-                    )));
+                    )).into());
                 }
                 sidecars::set_running(&self.container.docker, network, true).await?;
             }
@@ -162,7 +162,7 @@ impl Sandbox for DockerSandbox {
                 return self.container.docker
                     .unpause_container(self.id.as_str())
                     .await
-                    .map_err(|error| docker_error("unpausing container", error));
+                    .map_err(|error| docker_error("unpausing container", error).into());
             }
             // A daemon or VM crash may have ended the sandbox
             // without running stop's one-shot cleanup. Sweep those
@@ -183,8 +183,8 @@ impl Sandbox for DockerSandbox {
                 Err(error) if is_not_found(&error) => Err(Error::NotFound {
                     resource: ResourceKind::Sandbox,
                     id:       self.id.as_str().to_owned(),
-                }),
-                Err(error) => Err(docker_error("starting container", error)),
+                }.into()),
+                Err(error) => Err(docker_error("starting container", error).into()),
             }
         })
         .await
@@ -218,8 +218,8 @@ impl Sandbox for DockerSandbox {
                 }
                 None => Ok(()),
             };
-            confirm_stopped(&self.container.docker, self.id.as_str()).await?;
-            services
+            let primary = confirm_stopped(&self.container.docker, self.id.as_str()).await;
+            fence::combine(primary, services)
         })
         .await
     }
@@ -234,6 +234,7 @@ impl Sandbox for DockerSandbox {
                 self.network.as_deref(),
             )
             .await
+            .map_err(Into::into)
         })
         .await
     }
@@ -245,7 +246,7 @@ impl Sandbox for DockerSandbox {
                 .docker
                 .pause_container(self.id.as_str())
                 .await
-                .map_err(|error| docker_error("pausing container", error))
+                .map_err(|error| docker_error("pausing container", error).into())
         })
         .await
     }
@@ -257,7 +258,7 @@ impl Sandbox for DockerSandbox {
                 .docker
                 .unpause_container(self.id.as_str())
                 .await
-                .map_err(|error| docker_error("unpausing container", error))
+                .map_err(|error| docker_error("unpausing container", error).into())
         })
         .await
     }

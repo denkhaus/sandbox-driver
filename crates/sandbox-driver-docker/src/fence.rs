@@ -6,10 +6,10 @@
 //! No lease expiry or automatic takeover can restart work behind a drain.
 
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::future::Future;
 use std::process;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ use bollard::errors::Error as DockerApiError;
 use bollard::models::{ContainerCreateResponse, ContainerInspectResponse};
 use futures_util::future::BoxFuture;
 use sandbox_driver::contract::RemainingResource;
-use sandbox_driver::{Error, ProviderError, Result, TransportError};
+use sandbox_driver::{Error, ProviderError, Result, Sandbox, TransportError};
 use serde_json::Value;
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, timeout};
@@ -30,6 +30,11 @@ use crate::daemon::{docker_error, docker_kind, is_conflict};
 use crate::inspect::label_of;
 use crate::one_shot::ONE_SHOT_LABEL;
 use crate::sidecars::NETWORK_LABEL;
+
+mod failure;
+
+use failure::{Disposition, diagnostic};
+pub(crate) use failure::{Failure, WorkResult, combine};
 
 pub(crate) const FENCE_NAME_LABEL: &str = "sh.sandbox-driver.fence-name";
 pub(crate) const FENCE_LABEL: &str = "sh.sandbox-driver.fence";
@@ -86,7 +91,7 @@ pub(crate) fn run<'a, T: Send + 'a>(
     docker: &'a Docker,
     id: &'a str,
     operation: Operation,
-    work: impl Future<Output = Result<T>> + Send + 'a,
+    work: impl Future<Output = WorkResult<T>> + Send + 'a,
 ) -> BoxFuture<'a, Result<T>> {
     // Box this orchestration boundary: combining daemon inspection, claim
     // allocation, and the operation would otherwise inflate every caller.
@@ -94,40 +99,98 @@ pub(crate) fn run<'a, T: Send + 'a>(
         // Each daemon call in `acquire` carries its own bound, so a slow
         // marker creation still reports the marker it may have left.
         let Some(marker) = acquire(docker, id, operation).await? else {
-            return timeout(operation.budget(), work).await.map_err(|_| {
-                unconfirmed(
-                    id,
-                    "operation on an absent sandbox timed out; outcome is unknown",
-                )
-            })?;
+            return timeout(operation.budget(), work)
+                .await
+                .map_err(|_| {
+                    unconfirmed(
+                        id,
+                        "operation on an absent sandbox timed out; outcome is unknown",
+                    )
+                })?
+                .map_err(Failure::into_error);
         };
-        finish(docker, &marker, operation, work).await
+        finish(docker, &marker, id, operation, work, |_| {
+            Some(id.to_owned())
+        })
+        .await
     })
 }
 
 async fn finish<T>(
     docker: &Docker,
     marker: &str,
+    sandbox: &str,
     operation: Operation,
-    work: impl Future<Output = Result<T>>,
+    work: impl Future<Output = WorkResult<T>>,
+    completed_sandbox: impl FnOnce(&T) -> Option<String>,
 ) -> Result<T> {
     // A completed response (including a refusal) releases ownership. A lost
     // response does not prove that the daemon stopped processing the request.
     let result = match timeout(operation.budget(), work).await {
-        Ok(Err(error)) if retain_claim(&error) => return Err(retain_error(marker, error)),
+        Ok(Err(failure)) if failure.disposition == Disposition::Reconcile => {
+            return Err(retain_error(marker, failure.into_error()));
+        }
         Ok(result) => result,
         Err(_) => return Err(retained(marker, "operation timed out", None)),
     };
+    let sandbox_id = result.as_ref().ok().and_then(completed_sandbox);
     match timeout(
         OPERATION_TIMEOUT,
         remove_container_forced(docker, marker, "releasing sandbox fence"),
     )
     .await
     {
-        Ok(Ok(())) => result,
-        Ok(Err(error)) => Err(retained(marker, "fence release failed", Some(error))),
-        Err(_) => Err(retained(marker, "fence release timed out", None)),
+        Ok(Ok(())) => result.map_err(Failure::into_error),
+        Ok(Err(error)) => Err(release_failure(
+            marker,
+            sandbox,
+            sandbox_id.as_deref(),
+            "fence release failed",
+            error,
+            &result,
+        )),
+        Err(_) => Err(release_failure(
+            marker,
+            sandbox,
+            sandbox_id.as_deref(),
+            "fence release timed out",
+            Error::Transport(TransportError::new("fence release timed out")),
+            &result,
+        )),
     }
+}
+
+/// Release can fail after either a successful operation or a definite refusal.
+/// Record both outcomes before converting back to the public error contract.
+fn release_failure<T>(
+    marker: &str,
+    sandbox: &str,
+    sandbox_id: Option<&str>,
+    reason: &str,
+    release: Error,
+    result: &WorkResult<T>,
+) -> Error {
+    let operation_error = result
+        .as_ref()
+        .err()
+        .map(|failure| diagnostic(&failure.error));
+    let release_error = diagnostic(&release);
+    let mut failure = ProviderError::with_source(
+        docker_kind(),
+        format!("{reason}; sandbox fence retained for reconciliation"),
+        release,
+    );
+    failure.code = Some("transport".to_owned());
+    failure.detail = Some(serde_json::json!({
+        "fence_container": marker,
+        "sandbox": sandbox,
+        "sandbox_id": sandbox_id,
+        "outcome": "unknown",
+        "operation_outcome": if result.is_ok() { "succeeded" } else { "failed" },
+        "operation_error": operation_error,
+        "release_error": release_error,
+    }));
+    Error::Provider(failure)
 }
 
 async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Option<String>> {
@@ -208,18 +271,26 @@ pub(crate) fn reserve_creation(labels: &mut Option<HashMap<String, String>>) -> 
 /// Claims creation under `name`. The marker is labeled with `sandbox`, the
 /// name the caller requested, so a delete of that name sees the claim before
 /// the primary exists.
-pub(crate) fn create<'a, T: Send + 'a>(
+pub(crate) fn create<'a>(
     docker: &'a Docker,
     image: &'a str,
     name: &'a str,
     sandbox: &'a str,
-    work: impl Future<Output = Result<T>> + Send + 'a,
-) -> BoxFuture<'a, Result<T>> {
+    work: impl Future<Output = WorkResult<Arc<dyn Sandbox>>> + Send + 'a,
+) -> BoxFuture<'a, Result<Arc<dyn Sandbox>>> {
     // Boxed for the same reason as `run`.
     Box::pin(async move {
         let attempt = create_marker(docker, image, name, sandbox, sandbox, Operation::Create).await;
         let marker = claimed(name, attempt)?;
-        finish(docker, &marker, Operation::Create, work).await
+        finish(
+            docker,
+            &marker,
+            sandbox,
+            Operation::Create,
+            work,
+            |sandbox| Some(sandbox.id().as_str().to_owned()),
+        )
+        .await
     })
 }
 
@@ -269,11 +340,15 @@ fn claimed(name: &str, attempt: MarkerAttempt) -> Result<String> {
         }
         Ok(Ok(created)) => Ok(created.id),
         Ok(Err(error)) => {
-            let error = docker_error("acquiring sandbox fence", error);
-            Err(if uncertain(&error) {
-                retained(name, "fence acquisition outcome is unknown", Some(error))
+            let failure = Failure::from(docker_error("acquiring sandbox fence", error));
+            Err(if failure.disposition == Disposition::Reconcile {
+                retained(
+                    name,
+                    "fence acquisition outcome is unknown",
+                    Some(failure.into_error()),
+                )
             } else {
-                error
+                failure.into_error()
             })
         }
         Err(_) => Err(retained(name, "fence acquisition timed out", None)),
@@ -317,29 +392,6 @@ async fn ensure_absent(docker: &Docker, id: &str) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn retain_claim(error: &Error) -> bool {
-    matches!(error, Error::Provider(error) if error.code.as_deref() == Some("fence_leaked"))
-        || uncertain(error)
-}
-
-/// Whether any source reports an outcome the daemon has not confirmed.
-pub(crate) fn uncertain(error: &Error) -> bool {
-    let mut cause: Option<&(dyn StdError + 'static)> = Some(error);
-    while let Some(current) = cause {
-        if matches!(current.downcast_ref::<Error>(), Some(Error::Transport(_))) {
-            return true;
-        }
-        if let Some(error) = current.downcast_ref::<DockerApiError>() {
-            return !matches!(error, DockerApiError::DockerResponseServerError { .. });
-        }
-        if current.downcast_ref::<TransportError>().is_some() {
-            return true;
-        }
-        cause = current.source();
-    }
-    false
 }
 
 fn busy(message: &str) -> Error {
@@ -412,11 +464,13 @@ fn unconfirmed(id: &str, message: &str) -> Error {
 
 fn retained(marker: &str, reason: &str, source: Option<Error>) -> Error {
     let message = format!("{reason}; sandbox fence retained for reconciliation");
+    let cause = source.as_ref().map(diagnostic);
     let mut error = match source {
         Some(source) => ProviderError::with_source(docker_kind(), message, source),
         None => ProviderError::new(docker_kind(), message),
     };
     error.code = Some("transport".to_owned());
-    error.detail = Some(serde_json::json!({"fence_container": marker, "outcome": "unknown"}));
+    error.detail =
+        Some(serde_json::json!({"fence_container": marker, "outcome": "unknown", "cause": cause}));
     Error::Provider(error)
 }

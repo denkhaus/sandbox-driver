@@ -50,6 +50,31 @@ lease expiry, automatic takeover, or mutation replay. The error uses code
 `detail` (or the sandbox ID if acquisition did not reveal the claim). A cancelled future cannot return an error, so the labels provide the
 reconciliation record.
 
+HTTP 502 and 504 responses also retain ownership. A gateway can return these
+after forwarding a mutation, without establishing the daemon's outcome. This
+applies to claim acquisition as well as operations inside an acquired claim;
+neither is replayed automatically.
+
+Internally, operation failures carry a typed claim disposition separately from
+their diagnostic error. Combining primary/service or creation/cleanup outcomes
+retains any requirement for reconciliation before choosing the public error.
+The selected diagnostic cannot turn an unresolved operation into a releasable
+claim. Both stop failures remain available, including over the plugin protocol,
+using `related_error` in provider detail (nested under `cause` when wrapped as a
+transport failure).
+
+If claim release fails, `detail.operation_outcome` distinguishes completed work
+from failed work. `operation_error` and `release_error` preserve both reports,
+including provider codes and structured details. `sandbox` records the operation's
+target; a completed creation also records its actual `sandbox_id`, so a release
+failure does not discard the new resource's identity. Success is still withheld
+until release is confirmed.
+
+One-shot admission keeps its partial container and cleanup-attempt state until
+the claim outcome is known. An attach/start failure combined with uncertain
+cleanup retains ownership and both diagnostics; admission does not retry a
+cleanup request whose outcome is unknown.
+
 The claim must not be removed merely because its creator disconnected or a
 period of time passed. An operator or application recovery procedure must first
 establish that the original request can no longer change the sandbox and that

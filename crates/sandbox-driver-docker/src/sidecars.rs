@@ -40,7 +40,7 @@ use crate::daemon::{
     docker_error, docker_kind, is_not_found, is_not_modified, listed_id, tolerate_not_modified,
 };
 use crate::image::{image_present, pull_image};
-use crate::{MANAGED_LABEL, non_empty};
+use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
@@ -283,7 +283,11 @@ pub(crate) async fn sweep(docker: &Docker, network: &str, sandbox: Option<&str>)
 
 /// Stops or starts every sidecar on the network, alongside the main
 /// container's own stop/start.
-pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -> Result<()> {
+pub(crate) async fn set_running(
+    docker: &Docker,
+    network: &str,
+    running: bool,
+) -> fence::WorkResult<()> {
     let containers = docker
         .list_containers(Some(network_filter(network)))
         .await
@@ -297,7 +301,7 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
             {
                 Ok(()) => {}
                 Err(error) if is_not_modified(&error) => {}
-                Err(error) => return Err(docker_error("starting sidecar", error)),
+                Err(error) => return Err(docker_error("starting sidecar", error).into()),
             }
         } else {
             tolerate_not_modified(

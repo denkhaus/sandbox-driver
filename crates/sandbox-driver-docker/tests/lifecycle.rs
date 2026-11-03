@@ -11,14 +11,14 @@ use sandbox_driver::{
 };
 use sandbox_driver_docker::DockerProvider;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 struct Daemon {
-    provider: DockerProvider,
+    provider: Arc<DockerProvider>,
     requests: Arc<Mutex<Vec<String>>>,
     stop:     CancellationToken,
     task:     JoinHandle<()>,
@@ -121,7 +121,7 @@ impl Daemon {
             }
         });
         Self {
-            provider: DockerProvider::from_client(docker),
+            provider: Arc::new(DockerProvider::from_client(docker)),
             requests,
             stop,
             task,
@@ -746,29 +746,24 @@ async fn an_unidentifiable_one_shot_prevents_confirmed_stop() {
 
 #[tokio::test]
 async fn failed_creation_retains_ownership_if_creation_or_cleanup_is_uncertain() {
-    for (creation_disconnects, cleanup_disconnects) in
-        [(false, false), (false, true), (true, false), (true, true)]
+    for (creation_status, cleanup_status) in [500, 0, 502, 504]
+        .into_iter()
+        .flat_map(|creation| [500, 0, 502, 504].map(|cleanup| (creation, cleanup)))
     {
         let daemon = Daemon::new(move |request| {
             if request.contains("/images/") && request.contains("/json") {
                 (200, json!({}))
             } else if request.contains("/containers/create?name=example-net-db") {
-                if creation_disconnects {
-                    // The request was read, but its outcome is unknown.
-                    (0, Value::Null)
-                } else {
-                    (500, json!({"message": "service creation refused"}))
-                }
+                (
+                    creation_status,
+                    json!({"message": "service creation failed"}),
+                )
             } else if request.contains("/containers/create?name=example ") {
                 (201, json!({"Id": "main", "Warnings": []}))
             } else if request.contains("/networks/create") {
                 (201, json!({"Id": "network", "Warning": ""}))
             } else if request.contains("/containers/json?") && request.contains("network%3D") {
-                if cleanup_disconnects {
-                    (0, Value::Null)
-                } else {
-                    (500, json!({"message": "cleanup listing refused"}))
-                }
+                (cleanup_status, json!({"message": "cleanup listing failed"}))
             } else {
                 panic!("unexpected request: {request}");
             }
@@ -807,10 +802,10 @@ async fn failed_creation_retains_ownership_if_creation_or_cleanup_is_uncertain()
         let released = requests.iter().any(|request| {
             request.starts_with("DELETE ") && request.contains("/containers/fence?")
         });
-        let retain = creation_disconnects || cleanup_disconnects;
+        let retain = creation_status != 500 || cleanup_status != 500;
         assert_eq!(
             released, !retain,
-            "creation_disconnects={creation_disconnects}, cleanup_disconnects={cleanup_disconnects}: {requests:#?}"
+            "creation_status={creation_status}, cleanup_status={cleanup_status}: {requests:#?}"
         );
         let projection: ContractError =
             serde_json::from_value(detail).expect("shared cleanup error");
@@ -823,5 +818,458 @@ async fn failed_creation_retains_ownership_if_creation_or_cleanup_is_uncertain()
                 .any(|resource| resource.kind == "fence_container" && resource.id == "fence"),
             retain
         );
+    }
+}
+
+#[tokio::test]
+async fn stop_preserves_retention_when_both_termination_checks_fail() {
+    // A definite inspection refusal must not mask the other resource's
+    // known-live or unknown state, whichever resource fails first.
+    for (uncertain, expected_code) in [
+        (inspect(true), "fence_leaked"),
+        (json!("invalid inspect response"), "transport"),
+    ] {
+        for uncertain_service in [true, false] {
+            let stopped = AtomicBool::new(false);
+            let uncertain = uncertain.clone();
+            let daemon = Daemon::new(move |request| {
+                if request.contains("/containers/main/stop") {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                let primary =
+                    request.contains("/containers/main/json") && stopped.load(Ordering::SeqCst);
+                let service = request.contains("/containers/service/json");
+                if primary || service {
+                    return if service == uncertain_service {
+                        (200, uncertain.clone())
+                    } else {
+                        (500, json!({"message": "inspection unavailable"}))
+                    };
+                }
+                cleanup_reply(request)
+            })
+            .await;
+            let sandbox = daemon.attach_main().await;
+            let error = sandbox
+                .stop()
+                .await
+                .expect_err("termination is not confirmed");
+            let requests = daemon.finish().await;
+            let Error::Provider(error) = error else {
+                panic!("expected provider error");
+            };
+            assert_eq!(error.code.as_deref(), Some(expected_code));
+            assert_eq!(
+                error.detail.expect("retained fence detail")["fence_container"],
+                "fence"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("/containers/service/stop"))
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("/containers/service/json"))
+            );
+            assert!(
+                !requests.iter().any(|request| request.starts_with("DELETE ")
+                    && request.contains("/containers/fence?"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn definite_inspection_refusals_release_the_stop_claim() {
+    let stopped = AtomicBool::new(false);
+    let daemon = Daemon::new(move |request| {
+        if request.contains("/containers/main/stop") {
+            stopped.store(true, Ordering::SeqCst);
+        }
+        if (request.contains("/containers/main/json") && stopped.load(Ordering::SeqCst))
+            || request.contains("/containers/service/json")
+        {
+            return (500, json!({"message": "inspection unavailable"}));
+        }
+        cleanup_reply(request)
+    })
+    .await;
+    let sandbox = daemon.attach_main().await;
+    let error = sandbox.stop().await.expect_err("inspection was refused");
+    let requests = daemon.finish().await;
+    assert!(matches!(error, Error::Provider(error) if error.code.as_deref() == Some("500")));
+    assert!(requests.iter().any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?")));
+}
+
+async fn verify_stop_status_retention(status: u16, should_retain: bool) {
+    let daemon = Daemon::new(move |request| {
+        if request.contains("/containers/main/stop") {
+            return (
+                status,
+                json!({"message": "upstream stop did not provide a timely response"}),
+            );
+        }
+        cleanup_reply(request)
+    })
+    .await;
+    let sandbox = daemon.attach_main().await;
+    let error = sandbox.stop().await.expect_err("stop failed");
+    let requests = daemon.finish().await;
+    let released = requests
+        .iter()
+        .any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?"));
+    let trace: Vec<&str> = requests
+        .iter()
+        .map(|request| request.lines().next().expect("request line"))
+        .collect();
+    assert_eq!(
+        !released, should_retain,
+        "HTTP {status}; error: {error}; trace: {trace:#?}"
+    );
+}
+
+#[tokio::test]
+async fn gateway_timeout_must_not_release_an_in_flight_stop() {
+    for status in [502, 504] {
+        verify_stop_status_retention(status, true).await;
+    }
+}
+
+#[tokio::test]
+async fn control_definite_permission_refusal_can_release_stop() {
+    for status in [403, 409, 500, 503] {
+        verify_stop_status_retention(status, false).await;
+    }
+}
+
+#[tokio::test]
+async fn operation_and_release_outcomes_are_preserved() {
+    for work_fails in [false, true] {
+        for release_status in [204, 0, 500, 504] {
+            let stopped = AtomicBool::new(false);
+            let daemon = Daemon::with_manual_release(move |request| {
+                if work_fails && request.contains("one-shot") {
+                    return (500, json!({"message": "ORIGINAL_SWEEP_FAILURE"}));
+                }
+                if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
+                    return (release_status, json!({"message": "RELEASE_FAILURE"}));
+                }
+                if request.contains("/containers/main/stop") {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                if request.contains("/containers/main/json") {
+                    return (200, inspect(!stopped.load(Ordering::SeqCst)));
+                }
+                if request.contains("/containers/service/json") {
+                    return (200, inspect(false));
+                }
+                cleanup_reply(request)
+            })
+            .await;
+            let result = daemon.attach_main().await.stop().await;
+            let requests = daemon.finish().await;
+            assert_eq!(result.is_ok(), !work_fails && release_status == 204);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("DELETE ")
+                        && request.contains("/containers/fence?"))
+                    .count(),
+                1
+            );
+            if let Err(error) = result {
+                if work_fails {
+                    assert!(
+                        format!("{error:?}").contains("ORIGINAL_SWEEP_FAILURE"),
+                        "{error:?}"
+                    );
+                }
+                if release_status != 204 {
+                    let Error::Provider(failure) = error else {
+                        panic!("provider failure")
+                    };
+                    assert_eq!(failure.code.as_deref(), Some("transport"));
+                    let detail = failure.detail.unwrap();
+                    assert_eq!(
+                        detail["operation_outcome"],
+                        if work_fails { "failed" } else { "succeeded" }
+                    );
+                    assert_eq!(detail["operation_error"].is_null(), !work_fails);
+                    assert_eq!(detail["fence_container"], "fence");
+                    assert!(!detail["release_error"].is_null());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StopObservation {
+    Stopped,
+    Refused,
+    Running,
+    Disconnected,
+}
+
+impl StopObservation {
+    fn reply(self, resource: &str) -> (u16, Value) {
+        match self {
+            Self::Stopped => (200, inspect(false)),
+            Self::Refused => (
+                500,
+                json!({"message": format!("{resource} inspection refused")}),
+            ),
+            Self::Running => (200, inspect(true)),
+            Self::Disconnected => (0, Value::Null),
+        }
+    }
+
+    fn retains(self) -> bool {
+        matches!(self, Self::Running | Self::Disconnected)
+    }
+}
+
+#[tokio::test]
+async fn stop_combines_all_primary_and_service_outcomes() {
+    let observations = [
+        StopObservation::Stopped,
+        StopObservation::Refused,
+        StopObservation::Running,
+        StopObservation::Disconnected,
+    ];
+    for primary in observations {
+        for service in observations {
+            let stopped = AtomicBool::new(false);
+            let daemon = Daemon::new(move |request| {
+                if request.contains("/containers/main/stop") {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                if request.contains("/containers/main/json") && stopped.load(Ordering::SeqCst) {
+                    return primary.reply("primary");
+                }
+                if request.contains("/containers/service/json") {
+                    return service.reply("service");
+                }
+                cleanup_reply(request)
+            })
+            .await;
+            let result = daemon.attach_main().await.stop().await;
+            let requests = daemon.finish().await;
+            let released = requests.iter().any(|request| {
+                request.starts_with("DELETE ") && request.contains("/containers/fence?")
+            });
+            assert_eq!(
+                released,
+                !(primary.retains() || service.retains()),
+                "primary={primary:?}, service={service:?}"
+            );
+            assert_eq!(
+                result.is_ok(),
+                matches!(
+                    (primary, service),
+                    (StopObservation::Stopped, StopObservation::Stopped)
+                )
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("/containers/service/json"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_claim_acquisition_reports_the_claim_without_starting_work() {
+    for status in [502, 504] {
+        let daemon = Daemon::new(move |request| {
+            if request.contains("/containers/main/json") {
+                let mut primary = inspect(true);
+                primary["Config"]["Labels"]["sh.sandbox-driver.fence-name"] = json!("test-claim");
+                return (200, primary);
+            }
+            if request.contains("/containers/create?name=test-claim") {
+                return (
+                    status,
+                    json!({"message": "gateway could not confirm claim allocation"}),
+                );
+            }
+            panic!("unexpected request: {request}");
+        })
+        .await;
+        let error = daemon
+            .attach_main()
+            .await
+            .stop()
+            .await
+            .expect_err("unknown acquisition");
+        let Error::Provider(failure) = error else {
+            panic!("provider failure")
+        };
+        assert_eq!(failure.code.as_deref(), Some("transport"));
+        assert_eq!(failure.detail.unwrap()["fence_container"], "test-claim");
+        let requests = daemon.finish().await;
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("/containers/main/stop"))
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.starts_with("DELETE "))
+        );
+    }
+}
+
+#[tokio::test]
+async fn paired_stop_errors_survive_the_plugin_protocol() {
+    for service_disconnects in [false, true] {
+        let stopped = AtomicBool::new(false);
+        let daemon = Daemon::new(move |request| {
+            if request.contains("/containers/main/stop") {
+                stopped.store(true, Ordering::SeqCst);
+            }
+            if request.contains("/containers/main/json") && stopped.load(Ordering::SeqCst) {
+                return (500, json!({"message": "PRIMARY_INSPECTION_FAILURE"}));
+            }
+            if request.contains("/containers/service/json") {
+                return if service_disconnects {
+                    (0, Value::Null)
+                } else {
+                    (200, inspect(true))
+                };
+            }
+            cleanup_reply(request)
+        })
+        .await;
+        let (host, plugin) = duplex(1024 * 1024);
+        let (host_read, host_write) = split(host);
+        let (plugin_read, plugin_write) = split(plugin);
+        let serving = tokio::spawn(sandbox_driver_protocol::serve(
+            daemon.provider.clone() as Arc<dyn SandboxProvider>,
+            plugin_read,
+            plugin_write,
+        ));
+        let remote = sandbox_driver_protocol::PluginProvider::connect(host_read, host_write)
+            .await
+            .expect("connect plugin");
+        let sandbox = remote
+            .attach(&SandboxId::try_new("main").unwrap(), None)
+            .await
+            .expect("attach");
+        let error = sandbox.stop().await.expect_err("combined stop failure");
+        serving.abort();
+        let _ = serving.await;
+        let requests = daemon.finish().await;
+        let Error::Provider(failure) = error else {
+            panic!("provider failure")
+        };
+        let detail = failure.detail.expect("paired diagnostic");
+        assert!(
+            detail.to_string().contains("PRIMARY_INSPECTION_FAILURE"),
+            "{detail}"
+        );
+        assert!(detail.to_string().contains("related_error"), "{detail}");
+        assert_eq!(detail["fence_container"], "fence");
+        assert!(!requests.iter().any(
+            |request| request.starts_with("DELETE ") && request.contains("/containers/fence?")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn completed_creation_is_identifiable_when_release_fails() {
+    let daemon = Daemon::with_manual_release(|request| {
+        if request.contains("/images/") {
+            return (200, json!({}));
+        }
+        if request.contains("/containers/create?") {
+            return (201, json!({"Id": "main", "Warnings": []}));
+        }
+        if request.contains("/containers/main/json") {
+            let mut primary = inspect(true);
+            primary["State"]["Status"] = json!("running");
+            primary["HostConfig"]["NetworkMode"] = json!("default");
+            return (200, primary);
+        }
+        if request.contains("/containers/main/start") {
+            return (204, Value::Null);
+        }
+        if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
+            return (500, json!({"message": "RELEASE_FAILURE"}));
+        }
+        panic!("unexpected request: {request}");
+    })
+    .await;
+    let spec = SandboxSpec::new(SandboxSource::Image {
+        reference: "test-image".to_owned(),
+    })
+    .name("example");
+    let error = daemon
+        .provider
+        .create(&spec, None)
+        .await
+        .err()
+        .expect("release fails");
+    let Error::Provider(failure) = error else {
+        panic!("provider failure")
+    };
+    let detail = failure.detail.unwrap();
+    assert_eq!(detail["operation_outcome"], "succeeded");
+    assert_eq!(detail["sandbox_id"], "main");
+    assert_eq!(detail["sandbox"], "example");
+    assert_eq!(detail["fence_container"], "fence");
+    assert!(detail["operation_error"].is_null());
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn one_shot_admission_retains_uncertain_cleanup_without_replaying_it() {
+    for cleanup_status in [204, 403, 0, 502, 504] {
+        let daemon = Daemon::new(move |request| {
+            if request.contains("/images/") { return (200, json!({})); }
+            if request.contains("/containers/main/json") {
+                let mut primary = inspect(true);
+            primary["State"]["Status"] = json!("running");
+                primary["Mounts"] = json!([{"Type": "volume", "Name": "workspace", "Destination": "/workspace", "RW": true}]);
+                return (200, primary);
+            }
+            if request.contains("/containers/create ") { return (201, json!({"Id": "action", "Warnings": []})); }
+            if request.contains("/containers/action/attach?") { return (403, json!({"message": "ATTACH_REFUSED"})); }
+            if request.starts_with("DELETE ") && request.contains("/containers/action?") {
+                return (cleanup_status, json!({"message": "CLEANUP_FAILED"}));
+            }
+            panic!("unexpected request: {request}");
+        }).await;
+        let sandbox = daemon.attach_main().await;
+        let error = sandbox
+            .one_shot()
+            .expect("workspace one-shot")
+            .run(
+                &sandbox_driver::OneShotSpec::registry("test-image"),
+                sandbox_driver::ExecControls::buffered(),
+            )
+            .await
+            .expect_err("admission refused");
+        let requests = daemon.finish().await;
+        let removals: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.starts_with("DELETE ") && request.contains("/containers/action?")
+            })
+            .collect();
+        assert_eq!(removals.len(), 1, "cleanup must not replay: {requests:#?}");
+        let released = requests.iter().any(|request| {
+            request.starts_with("DELETE ") && request.contains("/containers/fence?")
+        });
+        assert_eq!(
+            released,
+            matches!(cleanup_status, 204 | 403),
+            "status={cleanup_status}; {error:?}"
+        );
+        assert!(format!("{error:?}").contains("ATTACH_REFUSED"));
     }
 }

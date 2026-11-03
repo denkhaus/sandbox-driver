@@ -265,7 +265,8 @@ impl SandboxProvider for DockerProvider {
                     let inspect = match self.inspect(id.as_str()).await {
                         Ok(inspect) => inspect,
                         Err(Error::NotFound { .. }) => {
-                            let sweep = one_shot::sweep(&self.docker, id.as_str());
+                            let sweep =
+                                async { Ok(one_shot::sweep(&self.docker, id.as_str()).await?) };
                             return fence::run(&self.docker, id.as_str(), Operation::Delete, sweep)
                                 .await;
                         }
@@ -279,7 +280,7 @@ impl SandboxProvider for DockerProvider {
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
                     fence::run(&self.docker, &container_id, Operation::Delete, async {
-                        remove_sandbox(&self.docker, &container_id, network.as_deref()).await
+                        Ok(remove_sandbox(&self.docker, &container_id, network.as_deref()).await?)
                     })
                     .await
                 },
