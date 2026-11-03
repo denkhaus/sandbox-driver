@@ -24,7 +24,7 @@ use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quot
 use crate::inspect::map_state;
 use crate::{
     DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT,
-    SIDECAR_NETWORK_LABEL, non_empty, sidecars,
+    SIDECAR_NETWORK_LABEL, fence, non_empty, sidecars,
 };
 
 /// Everything `create` decides before it touches the daemon, derived from
@@ -414,14 +414,22 @@ impl CreatedContainer {
             remaining,
         };
         let message = format!("{projection} after create failed: {error}");
-        // The cleanup failure stays the source because it decides whether
-        // the creation claim is retained; the creation failure travels in
-        // the message and `detail.cause`.
-        let mut failure = ProviderError::with_source(docker_kind(), message, cleanup_error);
-        failure.code = Some("incomplete_cleanup".to_owned());
         let mut detail = serde_json::to_value(projection).expect("cleanup projection serializes");
         detail["cause"] =
             serde_json::to_value(ErrorReport::from(&error)).expect("error report serializes");
+        detail["cleanup_cause"] = serde_json::to_value(ErrorReport::from(&cleanup_error))
+            .expect("cleanup error report serializes");
+        // Either failure can leave work in flight. Keep an uncertain creation
+        // in the source chain even when cleanup returned a definite refusal;
+        // otherwise the fence owner would mistake the combined failure for a
+        // confirmed outcome and release its claim. Both reports remain above.
+        let source = if fence::uncertain(&error) {
+            error
+        } else {
+            cleanup_error
+        };
+        let mut failure = ProviderError::with_source(docker_kind(), message, source);
+        failure.code = Some("incomplete_cleanup".to_owned());
         failure.detail = Some(detail);
         Error::Provider(failure)
     }

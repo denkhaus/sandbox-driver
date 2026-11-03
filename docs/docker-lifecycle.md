@@ -68,9 +68,11 @@ A failed create attempts dependent cleanup before removing the primary, with a
 30-second cleanup budget. Unconfirmed cleanup uses `incomplete_cleanup` and
 serializes the shared contract's `IncompleteCleanup` error in `detail`, including
 resource identifiers whose removal remains unconfirmed, plus the original
-creation failure as an error report under `cause`. A cleanup transport failure
-also retains the claim and includes it in the remaining resources. Creation
-failures whose cleanup succeeds preserve their original error.
+creation failure as an error report under `cause` and the cleanup failure under
+`cleanup_cause`. A transport failure during either creation or cleanup retains
+the claim and includes it in the remaining resources, even if the other failure
+was a completed daemon refusal. Creation failures whose cleanup succeeds
+preserve their original error.
 
 ## Verification and migration scope
 

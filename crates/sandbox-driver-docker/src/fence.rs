@@ -324,7 +324,8 @@ fn retain_claim(error: &Error) -> bool {
         || uncertain(error)
 }
 
-fn uncertain(error: &Error) -> bool {
+/// Whether any source reports an outcome the daemon has not confirmed.
+pub(crate) fn uncertain(error: &Error) -> bool {
     let mut cause: Option<&(dyn StdError + 'static)> = Some(error);
     while let Some(current) = cause {
         if matches!(current.downcast_ref::<Error>(), Some(Error::Transport(_))) {

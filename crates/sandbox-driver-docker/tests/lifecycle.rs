@@ -100,6 +100,10 @@ impl Daemon {
                     } else {
                         reply(request)
                     };
+                // A zero status injects a connection loss after reading the request.
+                if status == 0 {
+                    continue;
+                }
                 let body = if status == 204 || status == 304 {
                     Vec::new()
                 } else {
@@ -738,4 +742,86 @@ async fn an_unidentifiable_one_shot_prevents_confirmed_stop() {
             .iter()
             .any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?"))
     );
+}
+
+#[tokio::test]
+async fn failed_creation_retains_ownership_if_creation_or_cleanup_is_uncertain() {
+    for (creation_disconnects, cleanup_disconnects) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let daemon = Daemon::new(move |request| {
+            if request.contains("/images/") && request.contains("/json") {
+                (200, json!({}))
+            } else if request.contains("/containers/create?name=example-net-db") {
+                if creation_disconnects {
+                    // The request was read, but its outcome is unknown.
+                    (0, Value::Null)
+                } else {
+                    (500, json!({"message": "service creation refused"}))
+                }
+            } else if request.contains("/containers/create?name=example ") {
+                (201, json!({"Id": "main", "Warnings": []}))
+            } else if request.contains("/networks/create") {
+                (201, json!({"Id": "network", "Warning": ""}))
+            } else if request.contains("/containers/json?") && request.contains("network%3D") {
+                if cleanup_disconnects {
+                    (0, Value::Null)
+                } else {
+                    (500, json!({"message": "cleanup listing refused"}))
+                }
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        })
+        .await;
+        let mut spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "test-image".to_owned(),
+        })
+        .name("example");
+        spec.provider_config = json!({"sidecars": [{"name": "db", "image": "test-image"}]});
+        let error = daemon
+            .provider
+            .create(&spec, None)
+            .await
+            .err()
+            .expect("create fails");
+        let Error::Provider(failure) = error else {
+            panic!("provider error expected")
+        };
+        assert_eq!(failure.code.as_deref(), Some("incomplete_cleanup"));
+        let detail = failure.detail.expect("cleanup details");
+        assert!(
+            detail["cause"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("creating sidecar"),
+            "{detail}"
+        );
+        assert!(
+            detail["cleanup_cause"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("listing sidecars")),
+            "{detail}"
+        );
+        let requests = daemon.finish().await;
+        let released = requests.iter().any(|request| {
+            request.starts_with("DELETE ") && request.contains("/containers/fence?")
+        });
+        let retain = creation_disconnects || cleanup_disconnects;
+        assert_eq!(
+            released, !retain,
+            "creation_disconnects={creation_disconnects}, cleanup_disconnects={cleanup_disconnects}: {requests:#?}"
+        );
+        let projection: ContractError =
+            serde_json::from_value(detail).expect("shared cleanup error");
+        let ContractError::IncompleteCleanup { remaining, .. } = projection else {
+            panic!("incomplete cleanup expected");
+        };
+        assert_eq!(
+            remaining
+                .iter()
+                .any(|resource| resource.kind == "fence_container" && resource.id == "fence"),
+            retain
+        );
+    }
 }
