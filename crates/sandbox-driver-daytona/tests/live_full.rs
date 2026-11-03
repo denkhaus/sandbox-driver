@@ -1,6 +1,7 @@
 //! Deep live exercise of the Daytona provider: the positive paths the
 //! conformance suite only presence-checks. Requires a full-access
-//! `DAYTONA_API_KEY`; skipped otherwise. Every resource this test
+//! `DAYTONA_API_KEY`; ignored by default and run with
+//! `mise run test:live`. Every resource this test
 //! creates is deleted before it returns, on success and failure paths.
 
 use std::collections::BTreeMap;
@@ -73,10 +74,9 @@ fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn requested_working_directory_is_created_and_survives_attach() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let working_directory = format!("/home/daytona/{}", unique("sd-working-directory"));
@@ -188,10 +188,9 @@ async fn requested_working_directory_is_created_and_survives_attach() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let working_directory = format!("/home/daytona/{}", unique("sd-hybrid-git"));
@@ -272,10 +271,9 @@ async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn labels_timers_access_round_trip() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -379,10 +377,9 @@ async fn labels_timers_access_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn wall_clock_ttl_and_container_auto_pause_behavior() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -423,14 +420,13 @@ async fn wall_clock_ttl_and_container_auto_pause_behavior() {
 /// rather than asserting zero (the toolbox decides that, not the driver).
 /// A lossless run must decode exactly, which pins the two-encoder path.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 #[expect(
     clippy::print_stderr,
     reason = "the observed loss per run is the test's evidence"
 )]
 async fn fast_progress_output_completes_and_reports_loss() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -590,10 +586,9 @@ async fn run_fast(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn cidr_egress_limits_apply_at_create_and_runtime() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -653,10 +648,9 @@ async fn tcp_probe(sandbox: &dyn sandbox_driver::Sandbox) -> Result<String, Stri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn stop_resize_archive_restore_lifecycle() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     // Non-ephemeral: an ephemeral sandbox deletes itself on stop, and
@@ -758,13 +752,11 @@ async fn stop_resize_archive_restore_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     // An explicit VM verification must fail when access is unavailable.
     let require_vm = env::var("SANDBOX_DRIVER_DAYTONA_REQUIRE_VM").as_deref() == Ok("1");
-    if env::var("DAYTONA_API_KEY").is_err() {
-        assert!(!require_vm, "VM verification requires DAYTONA_API_KEY");
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
@@ -969,10 +961,9 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn filesystem_snapshot_restores_files_without_processes() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -1120,10 +1111,9 @@ async fn assert_live_process(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn snapshot_provider_round_trip() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
@@ -1232,10 +1222,9 @@ async fn snapshot_provider_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn dockerfile_snapshot_build_and_entrypoint_logs() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
@@ -1474,10 +1463,9 @@ async fn stdin_delivers_exact_bytes(sandbox: &dyn Sandbox) -> Result<(), String>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn streamed_stdin_is_interactive_exact_and_ends_at_eof() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {

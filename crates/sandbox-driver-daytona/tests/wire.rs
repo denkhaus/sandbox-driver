@@ -2,7 +2,7 @@
 //! suite — including the volume round trip and access-facet consistency
 //! — must hold through the wire exactly as it holds in-process.
 //!
-//! Live test: requires `DAYTONA_API_KEY`; skipped otherwise.
+//! Live test: requires `DAYTONA_API_KEY`; run with `mise run test:live`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,11 +26,9 @@ const TEST_SNAPSHOT: &str = "daytona-medium";
 const TEST_GIT_REPOSITORY: &str = "https://github.com/octocat/Hello-World.git";
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn daytona_passes_conformance_over_the_wire() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        // No credentials; nothing to verify.
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await
@@ -74,10 +72,9 @@ ENTRYPOINT ["/bin/sh", "-c", "echo conformance-entrypoint; echo conformance-entr
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn extended_daytona_streams_and_browser_access_cross_the_wire() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await

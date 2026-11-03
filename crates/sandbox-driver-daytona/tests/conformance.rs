@@ -1,8 +1,8 @@
 //! The daytona provider against the black-box conformance suite.
 //!
-//! Live test: requires `DAYTONA_API_KEY` (and creates roughly a dozen
-//! short-lived sandboxes from the default snapshot); skipped when no
-//! credentials are configured so CI stays green.
+//! Live test: requires `DAYTONA_API_KEY` and creates roughly a dozen
+//! short-lived sandboxes from the default snapshot. Ignored by default;
+//! run it with `mise run test:live`.
 
 use std::env;
 use std::sync::Arc;
@@ -20,15 +20,13 @@ const TEST_SNAPSHOT: &str = "daytona-medium";
 const TEST_GIT_REPOSITORY: &str = "https://github.com/octocat/Hello-World.git";
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 #[expect(
     clippy::print_stderr,
     reason = "the per-check report is the test's evidence"
 )]
 async fn daytona_provider_passes_conformance() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        // No credentials; nothing to verify.
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await
