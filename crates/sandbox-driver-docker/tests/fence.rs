@@ -15,10 +15,13 @@ use sandbox_driver::{
     Termination,
 };
 use sandbox_driver_docker::DockerProvider;
+use sandbox_driver_protocol::PluginProvider;
+use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 
+#[track_caller]
 fn assert_busy<T>(result: sandbox_driver::Result<T>) {
     assert!(
         matches!(&result, Err(Error::Provider(error)) if error.code.as_deref() == Some("busy")),
@@ -56,11 +59,33 @@ async fn wait_for_label(docker: &Docker, label: &str, id: &str) {
 async fn stop_fences_other_clients_exec_and_one_shots_and_blocks_start_during_drain() {
     let provider = DockerProvider::connect().await.expect("Docker is required");
     let other = DockerProvider::connect().await.expect("second provider");
+    verify_stop_fences_clients(&provider, &other, "embedded").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn separate_driver_processes_fence_exec_one_shots_and_restart() {
+    let provider = PluginProvider::spawn(Command::new(env!("CARGO_BIN_EXE_sandbox-driver-docker")))
+        .await
+        .expect("first Docker driver process");
+    let other = PluginProvider::spawn(Command::new(env!("CARGO_BIN_EXE_sandbox-driver-docker")))
+        .await
+        .expect("second Docker driver process");
+    verify_stop_fences_clients(&provider, &other, "spawned").await;
+    provider.shutdown().await.expect("first driver shuts down");
+    other.shutdown().await.expect("second driver shuts down");
+}
+
+async fn verify_stop_fences_clients(
+    provider: &dyn SandboxProvider,
+    other: &dyn SandboxProvider,
+    scenario: &str,
+) {
     let docker = Docker::connect_with_local_defaults().expect("Docker client");
     let mut spec = SandboxSpec::new(SandboxSource::Image {
         reference: IMAGE.to_owned(),
     })
-    .name(format!("fence-services-{}", process::id()));
+    .name(format!("fence-services-{scenario}-{}", process::id()));
     spec.provider_config = serde_json::json!({"sidecars": [{
         "name": "service", "image": IMAGE, "entrypoint": ["sleep", "600"]
     }]});

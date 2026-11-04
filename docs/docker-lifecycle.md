@@ -101,7 +101,20 @@ preserve their original error.
 
 ## Verification and migration scope
 
-The real-daemon fence tests are explicit integration tests:
+Run the Docker verification path against a real daemon:
+
+```sh
+mise run test:docker
+```
+
+This builds the provider executables, runs failure injection and concurrent
+in-process/wire conformance, explicitly enables the live fence tests, and runs
+the `lithos-sandbox` CLI workflow with live Docker required. The CLI launches the
+actual `sandbox-driver-docker` executable; the process-boundary fence test also
+starts two independent driver executables against the same sandbox. An
+unreachable daemon fails this task instead of silently skipping live coverage.
+
+To run only the real-daemon fence tests:
 
 ```sh
 cargo test --locked -p sandbox-driver-docker --test fence -- --ignored
@@ -109,8 +122,23 @@ cargo test --locked -p sandbox-driver-docker --test fence -- --ignored
 
 They exercise independent provider clients, stop versus exec/one-shots/services,
 start during draining, cancelled ownership, and attachment during creation.
+The separate-process case runs a command and a one-shot through one executable,
+stops their sandbox through the other, observes `busy` during draining, and
+checks that services stop and the old command stays dead after restart.
 The lifecycle failure-injection tests cover release failure, uncertain admission,
 retained ownership after primary removal, and incomplete creation cleanup.
+
+For a direct manual CLI check after `mise run dev`:
+
+```sh
+export SANDBOX_DRIVER_PLUGIN_DEV=1
+id=$(target/debug/lithos-sandbox --provider docker --output id sandbox create \
+  --image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111)
+target/debug/lithos-sandbox --provider docker sandbox exec "$id" -- uname -a
+target/debug/lithos-sandbox --provider docker sandbox stop "$id" --wait
+target/debug/lithos-sandbox --provider docker sandbox start "$id" --wait
+target/debug/lithos-sandbox --provider docker sandbox delete "$id"
+```
 
 Portable workload translation, namespace and descriptor reporting, next-API
 provider integration, and the new cross-provider conformance harness are separate
