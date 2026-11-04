@@ -237,12 +237,14 @@ fn is_runtime_path(container_path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+// Errors log at DEBUG: each one is returned to the caller, which decides
+// whether it is a failure. A missing file is often the answer it asked for.
 #[async_trait]
 impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id),
-        err
+        err(level = "debug")
     )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         self.read_range(path, 0, None).await
@@ -251,7 +253,7 @@ impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id, offset),
-        err
+        err(level = "debug")
     )]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         let mut bytes = sandbox_driver::BoundedBuffer::new(sandbox_driver::DEFAULT_BUFFER_BYTES);
@@ -278,7 +280,7 @@ impl Filesystem for DockerFs {
             sandbox_id = %self.container.id,
             byte_count = content.len()
         ),
-        err
+        err(level = "debug")
     )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let mut input = content;
@@ -329,18 +331,18 @@ impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id, recursive),
-        err
+        err(level = "debug")
     )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         self.derived.delete(path, recursive).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn exists(&self, path: &str) -> Result<bool> {
         self.derived.exists(path).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.derived.metadata(path).await
     }
@@ -348,18 +350,18 @@ impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id, depth),
-        err
+        err(level = "debug")
     )]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         self.derived.list_dir(path, depth).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn create_dir(&self, path: &str) -> Result<()> {
         self.derived.create_dir(path).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.derived.rename(from, to).await
     }
@@ -367,7 +369,7 @@ impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id, mode),
-        err
+        err(level = "debug")
     )]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
         self.derived.set_permissions(path, mode).await
@@ -380,13 +382,13 @@ impl Filesystem for DockerFs {
             sandbox_id = %self.container.id,
             byte_count = content.len()
         ),
-        err
+        err(level = "debug")
     )]
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
         self.derived.write_append(path, content).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let mut input = fs::File::open(local)
             .await
@@ -399,7 +401,7 @@ impl Filesystem for DockerFs {
         self.write_from(remote, &mut input, length).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err(level = "debug"))]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent)

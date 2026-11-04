@@ -27,3 +27,4 @@ clap.workspace = true
 sandbox-driver-conformance.workspace = true
 sandbox-driver-host = { path = "../sandbox-driver-host" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tracing-subscriber.workspace = true

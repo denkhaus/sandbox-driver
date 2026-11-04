@@ -67,9 +67,11 @@ fn read_error(path: &str, full: &Path) -> impl FnOnce(io::Error) -> Error {
     }
 }
 
+// Errors log at DEBUG: each one is returned to the caller, which decides
+// whether it is a failure. A missing file is often the answer it asked for.
 #[async_trait]
 impl Filesystem for HostFs {
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let full = self.resolve(path);
         let mut file = fs::File::open(&full)
@@ -83,7 +85,7 @@ impl Filesystem for HostFs {
         bytes.finish(outcome)
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn read_to(
         &self,
         path: &str,
@@ -102,7 +104,7 @@ impl Filesystem for HostFs {
         .map_err(io_error(format!("copying {} to output", full.display())))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", offset), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", offset), err(level = "debug"))]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let full = self.resolve(path);
@@ -123,7 +125,7 @@ impl Filesystem for HostFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "host", byte_count = content.len()),
-        err
+        err(level = "debug")
     )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.resolve(path);
@@ -137,7 +139,7 @@ impl Filesystem for HostFs {
             .map_err(io_error(format!("writing {}", full.display())))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", byte_count = length), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", byte_count = length), err(level = "debug"))]
     async fn write_from(
         &self,
         path: &str,
@@ -169,7 +171,7 @@ impl Filesystem for HostFs {
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "host", byte_count = content.len()),
-        err
+        err(level = "debug")
     )]
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -194,7 +196,11 @@ impl Filesystem for HostFs {
         outcome.map_err(context)
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", recursive), err)]
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "host", recursive),
+        err(level = "debug")
+    )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         let full = self.resolve(path);
         let metadata = match fs::symlink_metadata(&full).await {
@@ -214,12 +220,12 @@ impl Filesystem for HostFs {
         outcome.map_err(io_error(format!("deleting {}", full.display())))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn exists(&self, path: &str) -> Result<bool> {
         Ok(fs::try_exists(self.resolve(path)).await.unwrap_or(false))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let full = self.resolve(path);
         let metadata = fs::metadata(&full)
@@ -235,7 +241,7 @@ impl Filesystem for HostFs {
         Ok(info)
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", depth), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", depth), err(level = "debug"))]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         let root = self.resolve(path);
         let mut entries = Vec::new();
@@ -272,7 +278,7 @@ impl Filesystem for HostFs {
         Ok(entries)
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn create_dir(&self, path: &str) -> Result<()> {
         let full = self.resolve(path);
         fs::create_dir_all(&full)
@@ -280,7 +286,7 @@ impl Filesystem for HostFs {
             .map_err(io_error(format!("creating {}", full.display())))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let from_full = self.resolve(from);
         let to_full = self.resolve(to);
@@ -293,7 +299,7 @@ impl Filesystem for HostFs {
             )))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", mode), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", mode), err(level = "debug"))]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
         let full = self.resolve(path);
         #[cfg(unix)]
@@ -315,7 +321,7 @@ impl Filesystem for HostFs {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let full = self.resolve(remote);
         if let Some(parent) = full.parent() {
@@ -329,7 +335,7 @@ impl Filesystem for HostFs {
             .map_err(io_error(format!("uploading to {}", full.display())))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err(level = "debug"))]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         let full = self.resolve(remote);
         if let Some(parent) = local.parent() {
