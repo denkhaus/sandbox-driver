@@ -461,6 +461,41 @@ async fn a_one_shot_builds_from_the_workspace() {
     provider.shutdown().await.expect("shutdown");
 }
 
+/// Docker reports a paused container as running, but a paused sandbox must
+/// not admit a one-shot into its workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_sandbox_refuses_one_shots() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let sandbox = provider
+        .create(&alpine_spec("paused-one-shot"), None)
+        .await
+        .expect("create sandbox");
+    sandbox.pause().await.expect("pause");
+    let spec = OneShotSpec::registry(ALPINE)
+        .entrypoint("true")
+        .timeout(Duration::from_secs(120));
+    let refused = sandbox
+        .one_shot()
+        .expect("docker offers one-shots")
+        .run(&spec, ExecControls::default())
+        .await
+        .err();
+    let leftovers = one_shot_containers(sandbox.id().as_str()).await;
+    sandbox.resume().await.expect("resume");
+    sandbox.delete().await.expect("delete");
+    assert!(
+        matches!(&refused, Some(Error::Provider(error))
+            if error.message.contains("requires a running sandbox")),
+        "paused sandbox admitted a one-shot: {refused:?}"
+    );
+    assert!(
+        leftovers.is_empty(),
+        "one-shot containers left: {leftovers:?}"
+    );
+}
+
 async fn one_shot_containers(sandbox_id: &str) -> Vec<String> {
     let docker = Docker::connect_with_local_defaults().expect("docker");
     let mut filters = HashMap::new();

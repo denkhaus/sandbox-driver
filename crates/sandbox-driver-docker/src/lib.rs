@@ -46,7 +46,11 @@
 //! on cancellation that run from `/` and fail loudly when the stop
 //! cannot be requested. Docker itself is the
 //! sandbox registry — handles re-attach by container id across process
-//! restarts.
+//! restarts. Admissions and lifecycle changes coordinate through an unstarted,
+//! daemon-owned claim container. Conflicting lifecycle calls return provider
+//! code `busy`; cancellation or unknown daemon outcomes retain the claim for
+//! explicit reconciliation. See `docs/docker-lifecycle.md` for the scope,
+//! operation bounds, and migration limitations.
 
 mod access;
 mod config;
@@ -54,6 +58,7 @@ mod container;
 mod create;
 mod daemon;
 mod exec;
+mod fence;
 mod forward;
 mod fs;
 mod image;

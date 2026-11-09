@@ -30,6 +30,17 @@ pub(crate) fn docker_error(context: &str, error: DockerApiError) -> Error {
     Error::Provider(provider)
 }
 
+/// The ID of a container the daemon listed. A listing without one is a
+/// complete but unusable answer, not an unknown outcome.
+pub(crate) fn listed_id(id: Option<String>, what: &str) -> Result<String> {
+    id.ok_or_else(|| {
+        Error::Provider(ProviderError::new(
+            docker_kind(),
+            format!("daemon listed a {what} without an ID"),
+        ))
+    })
+}
+
 pub(crate) fn is_not_found(error: &DockerApiError) -> bool {
     matches!(error, DockerApiError::DockerResponseServerError {
         status_code: 404,

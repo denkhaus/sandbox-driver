@@ -50,6 +50,15 @@ depends = ["plugins:build"]
 description = "Run CLI black-box tests, including Docker when its daemon is reachable"
 run = "cargo nextest run --locked -p sandbox-driver-cli --test trycmd --test live --test plugins"
 
+[tasks."test:docker"]
+depends = ["plugins:build"]
+description = "Require live Docker and test lifecycle races, driver processes, and the CLI"
+env = { LITHOS_CLI_E2E_REQUIRE_LIVE = "1" }
+run = [
+  "cargo test --locked -p sandbox-driver-docker --test lifecycle --test conformance --test fence -- --include-ignored --nocapture",
+  "cargo test --locked -p sandbox-driver-cli --test live docker_cli_workflow -- --exact --nocapture",
+]
+
 [tasks."test:live"]
 depends = ["plugins:build"]
 description = "Run the live Daytona tests; requires DAYTONA_API_KEY and creates real resources"

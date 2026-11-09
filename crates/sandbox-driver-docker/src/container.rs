@@ -12,10 +12,11 @@ use bollard::errors::Error as DockerApiError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerInspectResponse, ExecInspectResponse};
 use futures_util::Stream;
-use sandbox_driver::{Error, ResourceKind, Result};
+use sandbox_driver::{Error, ProviderError, ResourceKind, Result};
 use tokio::io::AsyncWrite;
 
-use crate::daemon::{docker_error, is_not_found};
+use crate::daemon::{docker_error, docker_kind, is_not_found};
+use crate::fence::{self, Operation};
 use crate::{one_shot, sidecars};
 
 /// A started exec instance with its attached streams.
@@ -69,9 +70,24 @@ impl ContainerRef {
         inspect_container(&self.docker, &self.id).await
     }
 
-    /// Creates an exec from `options` and starts it attached to its
-    /// streams. `what` names the exec in errors: "stdio exec", say.
+    /// Admits new work: creates an exec from `options` under the sandbox
+    /// fence and starts it attached to its streams. `what` names the exec
+    /// in errors: "stdio exec", say.
     pub(crate) async fn start_attached(
+        &self,
+        options: CreateExecOptions<String>,
+        what: &str,
+    ) -> Result<AttachedExec> {
+        fence::run(&self.docker, &self.id, Operation::Admit, async {
+            Ok(self.start_control(options, what).await?)
+        })
+        .await
+    }
+
+    /// Starts an exec that only signals work already admitted, such as a
+    /// stop request. It bypasses admission: it starts no new work, and a
+    /// held lifecycle claim must not keep a stop from reaching a command.
+    pub(crate) async fn start_control(
         &self,
         options: CreateExecOptions<String>,
         what: &str,
@@ -156,6 +172,30 @@ pub(crate) async fn remove_container_forced(
         Err(error) if is_not_found(&error) => Ok(()),
         Err(error) => Err(docker_error(context, error)),
     }
+}
+
+/// A stop response is not enough when the subsequent state still permits
+/// execution. Missing state is also unconfirmed, never a successful fence.
+pub(crate) async fn confirm_stopped(docker: &Docker, id: &str) -> fence::WorkResult<()> {
+    let inspect = match inspect_container(docker, id).await {
+        Ok(inspect) => inspect,
+        Err(Error::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if inspect
+        .state
+        .as_ref()
+        .is_some_and(|state| state.running == Some(false) && state.paused != Some(true))
+    {
+        return Ok(());
+    }
+    let mut error = ProviderError::new(
+        docker_kind(),
+        "container termination could not be confirmed",
+    );
+    error.code = Some("fence_leaked".to_owned());
+    error.detail = Some(serde_json::json!({"container": id}));
+    Err(fence::Failure::reconcile(Error::Provider(error)))
 }
 
 /// Removes a sandbox's container and everything that depends on it.

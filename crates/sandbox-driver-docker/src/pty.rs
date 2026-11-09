@@ -133,7 +133,7 @@ impl DockerPtySession {
         };
         let AttachedExec { mut output, .. } = self
             .container
-            .start_attached(options, "pty cleanup exec")
+            .start_control(options, "pty cleanup exec")
             .await?;
         while let Some(chunk) = output.next().await {
             chunk.map_err(|error| docker_error("reading pty cleanup output", error))?;

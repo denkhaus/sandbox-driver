@@ -32,14 +32,16 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, StopLevel, Termination, stop_signal,
+    Result, SandboxState, StopLevel, Termination, stop_signal,
 };
 use tokio::time;
 
 use crate::container::{ContainerRef, remove_container_forced};
-use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
+use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found, listed_id};
+use crate::fence::{self, Operation};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
+use crate::inspect::map_state;
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
 use crate::{MANAGED_LABEL, non_empty};
 
@@ -232,11 +234,12 @@ impl DockerOneShot {
 /// One-shot output as the daemon streams it.
 type ContainerOutput = Pin<Box<dyn Stream<Item = StdResult<LogOutput, DockerApiError>> + Send>>;
 
-/// A one-shot container from creation to removal. Every failure between
-/// the two removes it, so a run never leaves a container behind.
+/// A one-shot container from creation to removal. Admission failures attempt
+/// cleanup once and preserve uncertain outcomes for reconciliation.
 struct OneShotContainer {
-    docker: Docker,
-    id:     String,
+    docker:            Docker,
+    id:                String,
+    cleanup_attempted: bool,
 }
 
 impl OneShotContainer {
@@ -246,14 +249,15 @@ impl OneShotContainer {
             .await
             .map_err(|error| docker_error("creating one-shot container", error))?;
         Ok(Self {
-            docker: docker.clone(),
-            id:     created.id,
+            docker:            docker.clone(),
+            id:                created.id,
+            cleanup_attempted: false,
         })
     }
 
     /// Attaches to both output streams, then starts the container, so no
-    /// output is missed. A failure at either step removes the container.
-    async fn attach_and_start(&self) -> Result<ContainerOutput> {
+    /// output is missed. A failure at either step attempts container cleanup.
+    async fn attach_and_start(&mut self) -> fence::WorkResult<ContainerOutput> {
         let attached = match self
             .docker
             .attach_container(
@@ -269,8 +273,9 @@ impl OneShotContainer {
         {
             Ok(attached) => attached,
             Err(error) => {
-                self.remove_now().await;
-                return Err(docker_error("attaching one-shot container", error));
+                return Err(self
+                    .abandon(docker_error("attaching one-shot container", error))
+                    .await);
             }
         };
         if let Err(error) = self
@@ -278,10 +283,19 @@ impl OneShotContainer {
             .start_container(&self.id, None::<StartContainerOptions<String>>)
             .await
         {
-            self.remove_now().await;
-            return Err(docker_error("starting one-shot container", error));
+            return Err(self
+                .abandon(docker_error("starting one-shot container", error))
+                .await);
         }
         Ok(attached.output)
+    }
+
+    async fn abandon(&mut self, error: Error) -> fence::Failure {
+        let failure = fence::Failure::from(error);
+        match self.remove_once().await {
+            Ok(()) => failure,
+            Err(cleanup) => failure.combine(cleanup.into()),
+        }
     }
 
     /// Asks the container to stop: a term is SIGTERM, a kill SIGKILL.
@@ -334,13 +348,18 @@ impl OneShotContainer {
     }
 
     /// Removes the container, running or not; the run is over.
-    async fn remove(self) {
-        self.remove_now().await;
+    async fn remove(mut self) {
+        let _ = self.remove_once().await;
     }
 
-    async fn remove_now(&self) {
-        let _ =
-            remove_container_forced(&self.docker, &self.id, "removing one-shot container").await;
+    /// Remember an attempted cleanup even if its future is cancelled: retrying
+    /// that uncertain mutation belongs to reconciliation, not admission.
+    async fn remove_once(&mut self) -> Result<()> {
+        if self.cleanup_attempted {
+            return Ok(());
+        }
+        self.cleanup_attempted = true;
+        remove_container_forced(&self.docker, &self.id, "removing one-shot container").await
     }
 }
 
@@ -380,9 +399,8 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
         .await
         .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
-        if let Some(id) = container.id {
-            remove_container_forced(docker, &id, "removing one-shot container").await?;
-        }
+        let id = listed_id(container.id, "one-shot")?;
+        remove_container_forced(docker, &id, "removing one-shot container").await?;
     }
     Ok(())
 }
@@ -406,10 +424,47 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-        let container =
-            OneShotContainer::create(&self.container.docker, self.container_config(spec, image))
+        // Releasing the fence can fail after the one-shot started; remove it
+        // then rather than leave it running with nobody draining its output.
+        let mut created = None;
+        let admitted = fence::run(
+            &self.container.docker,
+            &self.container.id,
+            Operation::Admit,
+            async {
+                // A sandbox state, not a spec field, decides admission. Docker
+                // reports a paused container as running, so classify it.
+                let state = map_state(&self.container.inspect().await?);
+                if state != SandboxState::Running {
+                    return Err(Error::Provider(ProviderError::new(
+                        docker_kind(),
+                        format!("one-shot requires a running sandbox, not {state:?}"),
+                    ))
+                    .into());
+                }
+                let container = OneShotContainer::create(
+                    &self.container.docker,
+                    self.container_config(spec, image),
+                )
                 .await?;
-        let output = container.attach_and_start().await?;
+                created.insert(container).attach_and_start().await
+            },
+        )
+        .await;
+        let output = match admitted {
+            Ok(output) => output,
+            Err(mut error) => {
+                if let Some(mut container) = created {
+                    if let Err(cleanup) = container.remove_once().await {
+                        error = fence::Failure::reconcile(error)
+                            .combine(cleanup.into())
+                            .into_error();
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let container = created.expect("successful admission created a one-shot container");
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
         let outcome = match drain_with_stops(

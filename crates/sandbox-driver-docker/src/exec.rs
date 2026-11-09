@@ -255,7 +255,7 @@ async fn request_stop(container: &ContainerRef, stop_file: &str, level: StopLeve
         ..Default::default()
     };
     let AttachedExec { id, mut output, .. } = container
-        .start_attached(options, "stop-request exec")
+        .start_control(options, "stop-request exec")
         .await?;
     // Drain to completion so the exit code below is final.
     while let Some(chunk) = output.next().await {

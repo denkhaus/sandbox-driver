@@ -2,6 +2,7 @@
 //! a guarded launch that removes what it created when a later step fails.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bollard::Docker;
 use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
@@ -9,19 +10,21 @@ use bollard::models::{
     ContainerInspectResponse, EndpointSettings, HostConfig, Mount, MountTypeEnum,
 };
 use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
+use sandbox_driver::contract::{Error as ContractError, RemainingResource};
 use sandbox_driver::{
-    BASH_ENV_VAR, Error, LifecycleTimers, NetworkPolicy, ProviderError, ProviderKind, Result,
-    SandboxKind, SandboxSource, SandboxSpec, SandboxState,
+    BASH_ENV_VAR, Error, ErrorReport, LifecycleTimers, NetworkPolicy, ProviderError, ProviderKind,
+    Result, SandboxKind, SandboxSource, SandboxSpec, SandboxState, TransportError,
 };
 use serde::Deserialize;
+use tokio::time;
 
 use crate::config::{DockerProviderConfig, RegistryAuth, Sidecar};
 use crate::container::{inspect_container, remove_container_forced};
-use crate::daemon::{POSIX_SH, docker_error, is_conflict, shell_quote};
+use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quote};
 use crate::inspect::map_state;
 use crate::{
     DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT,
-    SIDECAR_NETWORK_LABEL, non_empty, sidecars,
+    SIDECAR_NETWORK_LABEL, fence, non_empty, sidecars,
 };
 
 /// Everything `create` decides before it touches the daemon, derived from
@@ -380,28 +383,54 @@ impl CreatedContainer {
 
     /// Gives up on the container after `error`: dependencies go before
     /// the primary, so unsuccessful cleanup remains discoverable by
-    /// label. Returns the error that caused the abandonment.
-    pub(crate) async fn abandon(self, error: Error) -> Error {
+    /// label. Returns the original failure only after confirmed cleanup;
+    /// otherwise reports the resources whose removal remains unconfirmed.
+    pub(crate) async fn abandon(self, error: Error) -> fence::Failure {
+        let failure = fence::Failure::from(error);
+        let mut remaining = vec![RemainingResource {
+            kind: "container".to_owned(),
+            id:   self.id.clone(),
+        }];
         if let Some(network) = &self.sidecar_network {
-            if let Err(cleanup_error) = sidecars::sweep(&self.docker, network, Some(&self.id)).await
-            {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    "failed sandbox sidecar cleanup failed; primary retained for retry"
-                );
-                return error;
+            remaining.push(RemainingResource {
+                kind: "network".to_owned(),
+                id:   network.clone(),
+            });
+        }
+        let cleanup = async {
+            if let Some(network) = &self.sidecar_network {
+                sidecars::sweep(&self.docker, network, Some(&self.id)).await?;
+                remaining.retain(|resource| resource.kind != "network");
             }
-        }
-        if let Err(cleanup_error) =
             remove_container_forced(&self.docker, &self.id, "removing failed sandbox").await
-        {
+        };
+        let cleanup_error = match time::timeout(Duration::from_secs(30), cleanup).await {
+            Ok(Ok(())) => return failure,
+            Ok(Err(error)) => error,
+            Err(_) => Error::Transport(TransportError::new("failed-create cleanup timed out")),
+        };
+        failure.combine_with(cleanup_error.into(), |error, cleanup_error| {
             tracing::warn!(
-                provider_kind = "docker",
-                error = %cleanup_error,
-                "failed sandbox cleanup failed"
+                error = %error,
+                cleanup_error = %cleanup_error,
+                "failed-create cleanup incomplete"
             );
-        }
-        error
+            let projection = ContractError::IncompleteCleanup {
+                message: "failed-create cleanup could not be confirmed".to_owned(),
+                remaining,
+            };
+            let message = format!("{projection} after create failed: {error}");
+            let mut detail =
+                serde_json::to_value(projection).expect("cleanup projection serializes");
+            detail["cause"] =
+                serde_json::to_value(ErrorReport::from(&error)).expect("error report serializes");
+            detail["cleanup_cause"] = serde_json::to_value(ErrorReport::from(&cleanup_error))
+                .expect("cleanup error report serializes");
+            let mut failure = ProviderError::with_source(docker_kind(), message, error);
+            failure.code = Some("incomplete_cleanup".to_owned());
+            failure.detail = Some(detail);
+            Error::Provider(failure)
+        })
     }
 }
 

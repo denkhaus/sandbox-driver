@@ -2,6 +2,7 @@
 //! lifecycle events.
 
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +20,16 @@ use crate::{Conformance, Provision};
 /// How long a listing may lag behind a create before the check fails.
 const LIST_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_VISIBILITY_POLL: Duration = Duration::from_millis(500);
+
+/// Names and discovery labels must distinguish suites in the same process.
+fn sandbox_marker() -> String {
+    static NEXT_MARKER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "sandbox-driver-conformance-{}-{}",
+        process::id(),
+        NEXT_MARKER.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Default)]
 struct RecordingEventObserver {
@@ -73,7 +84,7 @@ pub(super) async fn provider_identity_and_list(ctx: &Conformance) -> CheckOutcom
 pub(super) async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
     let mut spec = ctx.specs.spec();
     if spec.name.is_none() {
-        spec.name = Some(format!("sandbox-driver-conformance-{}", process::id()));
+        spec.name = Some(sandbox_marker());
     }
     let sandbox = ctx.create_from_spec(&spec).await?;
     ctx.lease(&sandbox);
@@ -427,7 +438,7 @@ async fn check_fork(forked: &Arc<dyn Sandbox>, source_pid: &str) -> CheckOutcome
 }
 
 pub(super) async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
-    let marker = format!("conformance-{}", process::id());
+    let marker = sandbox_marker();
     let mut spec = ctx.specs.spec();
     spec.labels
         .insert("sandbox-driver-conformance".to_owned(), marker.clone());

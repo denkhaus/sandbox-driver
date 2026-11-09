@@ -35,15 +35,17 @@ use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
 use crate::config::{Sidecar, to_health_config};
+use crate::container::confirm_stopped;
 use crate::daemon::{
-    docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
+    docker_error, docker_kind, is_not_found, is_not_modified, listed_id, tolerate_not_modified,
 };
 use crate::image::{image_present, pull_image};
-use crate::{MANAGED_LABEL, non_empty};
+use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
-/// How long to wait for every sidecar to report healthy.
+/// How long to wait for every sidecar to report healthy, from when they
+/// have all been started.
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
 /// How often to poll a sidecar's health.
 const HEALTH_POLL: Duration = Duration::from_millis(250);
@@ -61,7 +63,8 @@ fn container_name(network: &str, sidecar: &Sidecar) -> String {
 
 /// Creates the network and every sidecar on it, then waits for the ones
 /// with a health check to report healthy; the ones without are left to
-/// run or exit as they will. Tears down what it started on any failure.
+/// run or exit as they will. The creation owner tears down partial resources
+/// on failure within its cleanup budget.
 pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]) -> Result<()> {
     let mut labels = HashMap::new();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
@@ -75,15 +78,9 @@ pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]
         .await
         .map_err(|error| docker_error("creating sidecar network", error))?;
 
-    match start_all(docker, network, sidecars, &labels).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Err(cleanup_error) = sweep(docker, network, None).await {
-                tracing::warn!(error = %cleanup_error, "failed sidecar cleanup failed");
-            }
-            Err(error)
-        }
-    }
+    // The creation owner performs bounded cleanup while retaining the
+    // primary container as the discovery anchor if cleanup is incomplete.
+    start_all(docker, network, sidecars, &labels).await
 }
 
 async fn start_all(
@@ -93,9 +90,6 @@ async fn start_all(
     labels: &HashMap<String, String>,
 ) -> Result<()> {
     for sidecar in sidecars {
-        if !image_present(docker, &sidecar.image).await? {
-            pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
-        }
         let container = container_name(network, sidecar);
         let env: Vec<String> = sidecar
             .env
@@ -143,16 +137,30 @@ async fn start_all(
             .await
             .map_err(|error| docker_error("starting sidecar", error))?;
     }
+    // One deadline for all of them: they were started together, so the
+    // readiness budget bounds the whole wait, not each service's turn.
+    let deadline = Instant::now() + HEALTH_WAIT;
     for sidecar in sidecars {
         if sidecar.health.is_some() {
-            await_health(docker, &container_name(network, sidecar)).await?;
+            await_health(docker, &container_name(network, sidecar), deadline).await?;
         }
     }
     Ok(())
 }
 
-async fn await_health(docker: &Docker, container: &str) -> Result<()> {
-    let deadline = Instant::now() + HEALTH_WAIT;
+/// Pulls missing sidecar images. `create` calls this before claiming the
+/// sandbox, as it does for the primary image, so a slow pull never spends
+/// the bounded provisioning budget held under the claim.
+pub(crate) async fn prepare_images(docker: &Docker, sidecars: &[Sidecar]) -> Result<()> {
+    for sidecar in sidecars {
+        if !image_present(docker, &sidecar.image).await? {
+            pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn await_health(docker: &Docker, container: &str, deadline: Instant) -> Result<()> {
     loop {
         let inspect = docker
             .inspect_container(container, None)
@@ -234,21 +242,21 @@ pub(crate) async fn sweep(docker: &Docker, network: &str, sandbox: Option<&str>)
         .await
         .map_err(|error| docker_error("listing sidecars", error))?;
     for container in containers {
-        if let Some(id) = container.id {
-            match docker
-                .remove_container(
-                    &id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if is_not_found(&error) => {}
-                Err(error) => return Err(docker_error("removing sidecar", error)),
-            }
+        let id = listed_id(container.id, "sidecar")?;
+
+        match docker
+            .remove_container(
+                &id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(docker_error("removing sidecar", error)),
         }
     }
     if let Some(sandbox) = sandbox {
@@ -287,48 +295,61 @@ pub(crate) async fn sweep(docker: &Docker, network: &str, sandbox: Option<&str>)
 
 /// Stops or starts every sidecar on the network, alongside the main
 /// container's own stop/start.
-pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -> Result<()> {
+pub(crate) async fn set_running(
+    docker: &Docker,
+    network: &str,
+    running: bool,
+) -> fence::WorkResult<()> {
     let containers = docker
         .list_containers(Some(network_filter(network)))
         .await
         .map_err(|error| docker_error("listing sidecars", error))?;
     for container in &containers {
-        let Some(id) = &container.id else { continue };
+        let id = listed_id(container.id.clone(), "sidecar")?;
         if running {
             match docker
-                .start_container(id, None::<StartContainerOptions<String>>)
+                .start_container(&id, None::<StartContainerOptions<String>>)
                 .await
             {
                 Ok(()) => {}
                 Err(error) if is_not_modified(&error) => {}
-                Err(error) => return Err(docker_error("starting sidecar", error)),
+                Err(error) => return Err(docker_error("starting sidecar", error).into()),
             }
         } else {
             tolerate_not_modified(
                 docker
-                    .stop_container(id, Some(StopContainerOptions { t: 1 }))
+                    .stop_container(&id, Some(StopContainerOptions { t: 1 }))
                     .await,
                 "stopping sidecar",
             )?;
         }
     }
+    // Stop every service before confirming any, so one unconfirmed service
+    // does not leave the rest running.
+    if !running {
+        for container in &containers {
+            if let Some(id) = &container.id {
+                confirm_stopped(docker, id).await?;
+            }
+        }
+        return Ok(());
+    }
     // Start every service before waiting: a health check may depend on
     // another service on the same network.
-    if running {
-        for container in containers {
-            let Some(id) = container.id else { continue };
-            let inspect = docker
-                .inspect_container(&id, None)
-                .await
-                .map_err(|error| docker_error("inspecting sidecar health", error))?;
-            if inspect
-                .state
-                .as_ref()
-                .and_then(|state| state.health.as_ref())
-                .is_some()
-            {
-                await_health(docker, &id).await?;
-            }
+    let deadline = Instant::now() + HEALTH_WAIT;
+    for container in containers {
+        let id = listed_id(container.id, "sidecar")?;
+        let inspect = docker
+            .inspect_container(&id, None)
+            .await
+            .map_err(|error| docker_error("inspecting sidecar health", error))?;
+        if inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.health.as_ref())
+            .is_some()
+        {
+            await_health(docker, &id, deadline).await?;
         }
     }
     Ok(())
