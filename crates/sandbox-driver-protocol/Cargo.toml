@@ -21,6 +21,9 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "ne
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 nix = { workspace = true, features = ["resource"] }
 clap.workspace = true

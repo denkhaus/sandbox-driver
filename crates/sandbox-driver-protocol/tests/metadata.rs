@@ -1,15 +1,14 @@
 //! Exercises discovery through real executable boundaries, without a backend.
 #![cfg(unix)]
 
+use std::fmt::Debug;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use std::{env, fs};
 
-use sandbox_driver::contract::{
-    Descriptor, Error, MutationOutcome, PluginTrust, ProviderEntry, ProviderName, ProviderSchemas,
-};
+use sandbox_driver::contract::{Error, PluginLocation, PluginTrust, ProviderName, ProviderSchemas};
 use sandbox_driver_protocol::file_sha256;
 use sandbox_driver_protocol::metadata::{DiscoveryLimits, SchemaDiscovery, write_schema};
 use serde_json::json;
@@ -39,15 +38,13 @@ impl Fixture {
         fs::set_permissions(&self.binary, fs::Permissions::from_mode(0o700))
             .expect("executable permission");
     }
-    fn entry(&self) -> ProviderEntry {
-        serde_json::from_value(json!({
-            "plugin": "fixture", "path": self.binary, "dev": true,
-            "args": ["--runtime-secret", "credential-value"],
-            "env": {"PRIVATE_TOKEN": "secret-value"},
-            "inherit_env": ["HOME", "USER", "PATH"],
-            "config": {"token": "config-secret"}, "secrets": ["PRIVATE_TOKEN"]
-        }))
-        .expect("entry")
+    fn entry(&self) -> PluginLocation {
+        PluginLocation {
+            entry: name(),
+            kind:  "fixture".to_string().try_into().expect("kind"),
+            path:  Some(self.binary.to_string_lossy().into()),
+            trust: Some(PluginTrust::Development),
+        }
     }
 }
 impl Drop for Fixture {
@@ -82,7 +79,7 @@ async fn probe_is_credential_free_and_cache_is_shared_by_digest() {
     let cache = SchemaDiscovery::default();
     assert!(!fixture.root.join("calls").exists(), "construction is cold");
     let first = cache
-        .discover("unused", &name(), &fixture.entry())
+        .discover(&fixture.entry())
         .await
         .expect("credential-free probe");
     assert_eq!(first.schemas(), &schemas());
@@ -91,10 +88,7 @@ async fn probe_is_credential_free_and_cache_is_shared_by_digest() {
     let copy = fixture.root.join("renamed");
     fs::copy(&fixture.binary, &copy).expect("same bytes at another path");
     renamed.path = Some(copy.to_string_lossy().into());
-    let second = cache
-        .discover("unused", &name(), &renamed)
-        .await
-        .expect("cached schema");
+    let second = cache.discover(&renamed).await.expect("cached schema");
     assert_eq!(second.digest(), first.digest());
     assert_eq!(
         fs::read_to_string(fixture.root.join("calls")).expect("calls"),
@@ -106,14 +100,11 @@ async fn probe_is_credential_free_and_cache_is_shared_by_digest() {
 async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() {
     let fixture = Fixture::new(&format!("echo probe >> calls\n{}", emit()));
     let cache = SchemaDiscovery::default();
-    let original = cache
-        .discover("unused", &name(), &fixture.entry())
-        .await
-        .expect("first");
+    let original = cache.discover(&fixture.entry()).await.expect("first");
     let mut entry = fixture.entry();
     entry.trust = None;
     assert!(matches!(
-        cache.discover("unused", &name(), &entry).await,
+        cache.discover(&entry).await,
         Err(Error::InvalidConfig { .. })
     ));
     let pin = file_sha256(&fixture.binary).await.expect("checksum");
@@ -122,7 +113,7 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
     });
     assert!(
         cache
-            .discover("unused", &name(), &entry)
+            .discover(&entry)
             .await
             .expect("pinned cache hit")
             .verified()
@@ -132,11 +123,11 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
         emit().replace("1.0", "2.0")
     ));
     assert!(matches!(
-        cache.discover("unused", &name(), &entry).await,
+        cache.discover(&entry).await,
         Err(Error::InvalidConfig { .. })
     ));
     original
-        .verify_unchanged()
+        .verify_unchanged(&name())
         .await
         .expect_err("cannot launch changed binary");
     assert_eq!(
@@ -145,7 +136,7 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
         "bad pin never executes"
     );
     let changed = cache
-        .discover("unused", &name(), &fixture.entry())
+        .discover(&fixture.entry())
         .await
         .expect("dev re-probes new bytes");
     assert_eq!(changed.schemas().version, "2.0");
@@ -153,28 +144,43 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
 }
 
 #[tokio::test]
-async fn missing_or_wrong_kind_entry_does_not_poison_other_entries() {
+async fn setup_errors_name_the_entry_and_do_not_poison_other_entries() {
     let fixture = Fixture::new(&emit());
     let cache = SchemaDiscovery::default();
+    let absent = fixture.root.join("absent");
     let mut bad = fixture.entry();
-    bad.path = Some(fixture.root.join("absent").to_string_lossy().into());
-    assert!(matches!(
-        cache.discover("unused", &name(), &bad).await,
-        Err(Error::Unavailable {
-            outcome: MutationOutcome::NotStarted,
-            ..
-        })
-    ));
+    bad.path = Some(absent.to_string_lossy().into());
+    let message = config_error(cache.discover(&bad).await, "path");
+    assert!(message.contains(&absent.display().to_string()), "{message}");
+    bad.path = Some("plugins/fixture".into());
+    config_error(cache.discover(&bad).await, "path");
+    bad.path = None;
+    config_error(cache.discover(&bad).await, "path");
     bad = fixture.entry();
-    bad.plugin = "other".to_string().try_into().expect("kind");
-    assert!(matches!(
-        cache.discover("unused", &name(), &bad).await,
-        Err(Error::InvalidConfig { .. })
-    ));
+    bad.trust = Some(PluginTrust::Sha256 {
+        digest: "0".repeat(64).try_into().expect("digest"),
+    });
+    let message = config_error(cache.discover(&bad).await, "sha256");
+    let actual = file_sha256(&fixture.binary).await.expect("checksum");
+    assert!(message.contains(&actual), "re-pinnable: {message}");
+    bad = fixture.entry();
+    bad.kind = "other".to_string().try_into().expect("kind");
+    config_error(cache.discover(&bad).await, "plugin");
     cache
-        .discover("unused", &name(), &fixture.entry())
+        .discover(&fixture.entry())
         .await
         .expect("unrelated entry still usable");
+}
+
+fn config_error(result: Result<impl Debug, Error>, field: &str) -> String {
+    match result {
+        Err(Error::InvalidConfig {
+            entry,
+            path,
+            message,
+        }) if entry == name() && path == field => message,
+        other => panic!("expected an invalid {field} for the entry, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -195,13 +201,13 @@ async fn invalid_failed_and_oversize_probes_are_never_cached_or_echoed() {
         })
         .expect("limits");
         let error = cache
-            .discover("unused", &name(), &fixture.entry())
+            .discover(&fixture.entry())
             .await
             .expect_err("bad probe");
         assert!(!format!("{error:?}").contains("secret-value"));
         fixture.write(&emit());
         cache
-            .discover("unused", &name(), &fixture.entry())
+            .discover(&fixture.entry())
             .await
             .expect("successful retry");
     }
@@ -241,10 +247,7 @@ async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
         ..DiscoveryLimits::default()
     })
     .expect("limits");
-    cache
-        .discover("unused", &name(), &fixture.entry())
-        .await
-        .expect_err("timeout");
+    cache.discover(&fixture.entry()).await.expect_err("timeout");
     let pid = fs::read_to_string(fixture.root.join("pid"))
         .expect("pid")
         .trim()
@@ -253,11 +256,7 @@ async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
     assert_dead(pid).await;
     fs::remove_file(fixture.root.join("pid")).expect("remove pid");
     let entry = fixture.entry();
-    let task = tokio::spawn(async move {
-        SchemaDiscovery::default()
-            .discover("unused", &name(), &entry)
-            .await
-    });
+    let task = tokio::spawn(async move { SchemaDiscovery::default().discover(&entry).await });
     wait_for_file(&fixture.root.join("pid")).await;
     let pid = fs::read_to_string(fixture.root.join("pid"))
         .expect("pid")
@@ -270,41 +269,44 @@ async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
 }
 
 #[tokio::test]
-async fn admission_and_cache_storage_are_bounded() {
-    let fixture = Fixture::new("echo $$ > pid; exec /bin/sleep 30");
+async fn concurrent_discoveries_wait_and_share_one_probe() {
+    let fixture = Fixture::new(&format!("echo probe >> calls\n/bin/sleep 0.2\n{}", emit()));
+    let other = Fixture::new(&format!("/bin/sleep 0.2\n{}", emit()));
     let cache = SchemaDiscovery::try_new(DiscoveryLimits {
         concurrent_probes: 1,
+        ..DiscoveryLimits::default()
+    })
+    .expect("limits");
+    let (entry, other_entry) = (fixture.entry(), other.entry());
+    let results = tokio::join!(
+        cache.discover(&entry),
+        cache.discover(&entry),
+        cache.discover(&entry),
+        cache.discover(&other_entry),
+        cache.discover(&other_entry),
+    );
+    for result in [results.0, results.1, results.2, results.3, results.4] {
+        result.expect("capacity waits instead of refusing");
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("calls")).expect("calls"),
+        "probe\n",
+        "one probe per binary"
+    );
+}
+
+#[tokio::test]
+async fn cache_storage_is_bounded() {
+    let cache = SchemaDiscovery::try_new(DiscoveryLimits {
         cached_binaries: 1,
         ..DiscoveryLimits::default()
     })
     .expect("limits");
-    let entry = fixture.entry();
-    let name = name();
-    let mut pending = Box::pin(cache.discover("unused", &name, &entry));
-    let pid_path = fixture.root.join("pid");
-    tokio::select! {
-        result = &mut pending => panic!("probe returned early: {result:?}"),
-        () = wait_for_file(&pid_path) => {}
-    }
-    assert!(matches!(
-        cache.discover("unused", &name, &entry).await,
-        Err(Error::ResourceExhausted { .. })
-    ));
-    drop(pending);
     let first = Fixture::new(&format!("echo probe >> calls\n{}", emit()));
     let second = Fixture::new(&emit());
-    cache
-        .discover("unused", &name, &first.entry())
-        .await
-        .expect("first");
-    cache
-        .discover("unused", &name, &second.entry())
-        .await
-        .expect("evicts first");
-    cache
-        .discover("unused", &name, &first.entry())
-        .await
-        .expect("probes again");
+    cache.discover(&first.entry()).await.expect("first");
+    cache.discover(&second.entry()).await.expect("evicts first");
+    cache.discover(&first.entry()).await.expect("probes again");
     assert_eq!(
         fs::read_to_string(first.root.join("calls")).expect("calls"),
         "probe\nprobe\n"
@@ -312,10 +314,37 @@ async fn admission_and_cache_storage_are_bounded() {
 }
 
 #[tokio::test]
-async fn sdk_output_and_runtime_metadata_agreement() {
+async fn descendants_of_a_probe_are_killed_with_it() {
+    for body in [
+        // Fails after the timeout while a background child holds stdout.
+        "/bin/sleep 30 &\necho $! > pid\nwait".to_owned(),
+        // Succeeds, leaving a background child behind.
+        format!(
+            "/bin/sleep 30 </dev/null >/dev/null 2>&1 &\necho $! > pid\n{}",
+            emit()
+        ),
+    ] {
+        let fixture = Fixture::new(&body);
+        let cache = SchemaDiscovery::try_new(DiscoveryLimits {
+            timeout: Duration::from_millis(500),
+            ..DiscoveryLimits::default()
+        })
+        .expect("limits");
+        let _ = cache.discover(&fixture.entry()).await;
+        let pid = fs::read_to_string(fixture.root.join("pid"))
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+        assert_dead(pid).await;
+    }
+}
+
+#[tokio::test]
+async fn sdk_output_round_trips_through_discovery() {
     let fixture = Fixture::new(&emit());
     let discovered = SchemaDiscovery::default()
-        .discover("unused", &name(), &fixture.entry())
+        .discover(&fixture.entry())
         .await
         .expect("discovery");
     let mut bytes = Vec::new();
@@ -324,19 +353,5 @@ async fn sdk_output_and_runtime_metadata_agreement() {
         serde_json::from_slice::<ProviderSchemas>(&bytes).expect("one object"),
         schemas()
     );
-    let mut descriptor: Descriptor = serde_json::from_value(json!({
-        "schemas": schemas(), "namespace":{"id":"fixture:machine", "scope":"machine"},
-        "isolation":"none", "durability":"process", "access":"owner_process",
-        "sources":["host_directory"], "locality": {"host_address":null},
-        "resources":[], "network":["provider_default"], "ports":{"exposable":"none"}, "capabilities":{}
-    })).expect("descriptor");
-    discovered.check_descriptor(&descriptor).expect("matching");
-    descriptor.schemas.version = "new-version".into();
-    assert!(matches!(
-        discovered.check_descriptor(&descriptor),
-        Err(Error::Transport {
-            outcome: MutationOutcome::NotStarted,
-            ..
-        })
-    ));
+    assert_eq!(discovered.schemas(), &schemas());
 }

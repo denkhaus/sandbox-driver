@@ -1107,35 +1107,44 @@ contract. Existing `launch_plugin`, `PluginProvider`, and `serve_stdio` remain
 the v2 entry points.
 
 `SchemaDiscovery` starts nothing when constructed. An explicit `discover`
-resolves only the selected entry, checks its checksum (or explicit development
-trust), and runs the executable with exactly `--describe-schema`. The child
-gets null stdin, no runtime arguments, no connection configuration, and no
-configured, inherited, or resolved secret environment. On Unix the probe PATH
-is `/usr/bin:/bin`; no HOME or user PATH is forwarded. On Windows only
-SystemRoot is forwarded. The executable writes one `ProviderSchemas` JSON
-object and exits successfully; diagnostics belong on stderr. SDK authors can
-use `metadata::write_schema` before constructing their provider or loading
-runtime settings, then exit.
+takes only a `PluginLocation` (entry name, kind, path, trust), never the
+entry's config, arguments, environment or secrets. The path must be absolute;
+there is no search of the caller's `PATH`. Discovery checks the checksum (or
+explicit development trust) and only then runs the executable with exactly
+`--describe-schema`. The child gets null stdin, `/` as its working directory,
+and no runtime arguments, connection configuration, or configured, inherited,
+or resolved secret environment. On Unix the probe PATH is `/usr/bin:/bin`; no
+HOME or user PATH is forwarded. On Windows only SystemRoot is forwarded. The
+executable writes one `ProviderSchemas` JSON object and exits successfully;
+diagnostics belong on stderr and are logged, never put in an error. SDK
+authors can use `metadata::write_schema` before constructing their provider or
+loading runtime settings, then exit.
 
 Default budgets are five seconds for the whole discovery call, 1 MiB of stdout,
-64 KiB of stderr, four concurrent discoveries, and 64 cached binaries. Both
-pipes are drained concurrently and bounded. Timeout, cancellation, failure,
-or excessive output drops and kills the probe child; Tokio owns reaping.
-Over-capacity calls fail before launch. Probe output is not included in errors.
+64 KiB of stderr, four concurrent probes, and 64 cached binaries. A probe
+beyond the concurrency budget waits within its caller's timeout; concurrent
+discoveries of one binary share a single probe. Both pipes are drained
+concurrently and bounded. On Unix the probe runs in its own process group,
+which is killed when the probe returns, fails, times out or is cancelled, so
+descendants do not outlive it.
 
 The cache contains metadata only, keyed by the actual SHA-256 of the executable.
-Every lookup rehashes the selected executable and checks that entry's trust,
+Every lookup rehashes the selected executable and checks that location's trust,
 even on a cache hit. Changed bytes require rediscovery; failed probes are not
-cached. Cache eviction permits a later probe. `DiscoveredPlugin` retains the
-canonical executable path, digest, schemas, and whether a pin was verified.
-Runtime integration must call `verify_unchanged` immediately before launch and
-`check_descriptor` after initialization, before sending any sandbox operation.
-The latter compares kind, version, schemas, and required secret names; cached
-metadata never supplies namespace or capability facts. Unlike legacy v2 kind
-aliasing, the configured new-contract plugin kind must match discovery.
+cached. Cache eviction (oldest first) permits a later probe. `DiscoveredPlugin`
+retains the canonical executable path, digest, schemas, and whether a pin was
+verified. Runtime launch must call `verify_unchanged` immediately before
+starting the configured runtime; the catalog compares the runtime's descriptor
+with the discovered schemas before any sandbox operation. Cached metadata never
+supplies namespace or capability facts. Unlike legacy v2 kind aliasing, the
+configured new-contract plugin kind must match discovery.
 
-Probing executes trusted code, not sandboxed code. Installation directories and
-executables must be protected against concurrent modification. The checksum
-covers the executable bytes, not interpreters, shared libraries, or dependencies.
-No runtime adapter or new protocol negotiation is implied by successful
-metadata discovery; those remain separate migration steps.
+A missing, relative, non-executable or mismatched executable is
+`invalid_config` naming the entry and the `path`, `sha256` or `plugin` field;
+a mismatch reports both digests. A probe that fails, times out or prints
+anything but one schemas object is `unavailable` with outcome `not_started`.
+
+Probing executes trusted code, not sandboxed code. The executable is hashed and
+then executed by path, so installation directories and executables must be
+protected against concurrent modification. The checksum covers the executable
+bytes, not interpreters, shared libraries, or dependencies.

@@ -3,34 +3,41 @@
 //!
 //! Probes execute trusted code, not sandboxed code. Installations must protect
 //! executable files and their parent directories against concurrent
-//! replacement. The digest covers the executable, not an interpreter or its
-//! dependencies.
+//! replacement: the executable is hashed, then executed by path. The digest
+//! covers the executable, not an interpreter or its dependencies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
+use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
+use nix::unistd::Pid;
 use sandbox_driver::contract::{
-    Descriptor, Error, MutationOutcome, PluginTrust, ProviderEntry, ProviderName, ProviderSchemas,
+    Error, MutationOutcome, PluginLocation, PluginTrust, ProviderName, ProviderSchemas,
     Sha256Digest,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
-use tokio::{task, time};
+use tokio::sync::{OnceCell, Semaphore};
+use tokio::{fs, time};
 
-use crate::discovery::{PluginConfig, file_sha256, resolve_plugin_binary};
+use crate::discovery::file_sha256;
 
 /// Budgets shared by all probes using one discovery cache.
 #[derive(Clone, Debug)]
 pub struct DiscoveryLimits {
-    /// Includes executable lookup, hashing, probe exit, and both output pipes.
+    /// One discovery call, including waiting for probe capacity, hashing,
+    /// probe exit, and both output pipes.
     pub timeout:           Duration,
     pub stdout_bytes:      usize,
     pub stderr_bytes:      usize,
+    /// Probes running at once. Further probes wait within their timeout;
+    /// cache hits never wait.
     pub concurrent_probes: usize,
     pub cached_binaries:   usize,
 }
@@ -47,13 +54,22 @@ impl Default for DiscoveryLimits {
     }
 }
 
+type Probe = Arc<OnceCell<Arc<ProviderSchemas>>>;
+
 /// Bounded in-memory metadata cache. Construction performs no lookup or launch.
-/// Each lookup rehashes the executable and enforces that entry's trust policy,
-/// including cache hits. Failed probes are never cached.
+/// Each lookup rehashes the executable and enforces that location's trust
+/// policy, including cache hits. Concurrent lookups of one binary share one
+/// probe. Failed probes are never cached.
 pub struct SchemaDiscovery {
     limits: DiscoveryLimits,
     probes: Semaphore,
-    cache:  Mutex<BTreeMap<Sha256Digest, Arc<ProviderSchemas>>>,
+    cache:  Mutex<Cache>,
+}
+
+#[derive(Default)]
+struct Cache {
+    entries: BTreeMap<Sha256Digest, Probe>,
+    order:   VecDeque<Sha256Digest>,
 }
 
 impl Default for SchemaDiscovery {
@@ -81,102 +97,74 @@ impl SchemaDiscovery {
         Ok(Self {
             probes: Semaphore::new(limits.concurrent_probes),
             limits,
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(Cache::default()),
         })
     }
 
-    /// Resolves only the selected entry. The probe receives exactly
-    /// `--describe-schema`, null stdin, a platform-only environment, and no
-    /// entry config, arguments, explicit/inherited environment, or secrets.
-    /// Saturation fails before launching instead of queuing unbounded work.
-    pub async fn discover(
-        &self,
-        prefix: &str,
-        name: &ProviderName,
-        entry: &ProviderEntry,
-    ) -> Result<DiscoveredPlugin, Error> {
-        let _permit = self
-            .probes
-            .try_acquire()
-            .map_err(|_| Error::ResourceExhausted {
-                message:        "metadata discovery capacity exhausted".into(),
-                retry_after_ms: None,
-            })?;
-        time::timeout(
-            self.limits.timeout,
-            self.discover_inner(prefix, name, entry),
-        )
-        .await
-        .map_err(|_| unavailable("metadata discovery timed out"))?
+    /// Resolves only the selected location. The probe receives exactly
+    /// `--describe-schema`, null stdin, `/` as its working directory, a
+    /// platform-only environment, and no entry config, arguments,
+    /// explicit/inherited environment, or secrets. It runs in its own process
+    /// group, which is killed when the probe ends, fails or is cancelled.
+    pub async fn discover(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
+        time::timeout(self.limits.timeout, self.discover_inner(location))
+            .await
+            .map_err(|_| unavailable(&location.entry, "metadata discovery timed out"))?
     }
 
-    async fn discover_inner(
-        &self,
-        prefix: &str,
-        name: &ProviderName,
-        entry: &ProviderEntry,
-    ) -> Result<DiscoveredPlugin, Error> {
-        let trust = entry.trust.as_ref().ok_or_else(|| {
+    async fn discover_inner(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
+        let entry = &location.entry;
+        let trust = location.trust.as_ref().ok_or_else(|| {
             invalid_config(
-                name,
+                entry,
                 "sha256",
                 "pin the plugin checksum or explicitly set dev = true",
             )
         })?;
-        let config = PluginConfig::new(entry.plugin.clone());
-        let config = match &entry.path {
-            Some(path) => config.path(path),
-            None => config,
-        };
-        let prefix = prefix.to_owned();
-        let path = task::spawn_blocking(move || {
-            resolve_plugin_binary(&prefix, &config).and_then(|path| {
-                path.canonicalize()
-                    .map_err(|error| sandbox_driver::Error::io("resolving plugin", error))
-            })
-        })
-        .await
-        .map_err(|_| unavailable("plugin lookup failed"))?
-        .map_err(|_| unavailable("plugin executable is missing or inaccessible"))?;
-        let digest = digest(&path).await?;
+        let path = resolve(location).await?;
+        let digest = digest(entry, &path).await?;
         if let PluginTrust::Sha256 { digest: expected } = trust {
             if expected != &digest {
                 return Err(invalid_config(
-                    name,
+                    entry,
                     "sha256",
-                    "plugin executable checksum mismatch",
+                    &format!(
+                        "plugin executable checksum mismatch for {}: pinned {expected}, found {digest}",
+                        path.display()
+                    ),
                 ));
             }
         }
-        let cached = self
-            .cache
-            .lock()
-            .expect("metadata cache lock")
-            .get(&digest)
-            .cloned();
-        let schemas = if let Some(schemas) = cached {
-            schemas
-        } else {
-            let schemas = Arc::new(probe(&path, &self.limits).await?);
-            if self::digest(&path).await? != digest {
-                return Err(invalid_config(
-                    name,
-                    "sha256",
-                    "plugin executable changed during discovery",
-                ));
-            }
-            let mut cache = self.cache.lock().expect("metadata cache lock");
-            if cache.len() >= self.limits.cached_binaries {
-                cache.pop_first();
-            }
-            cache.insert(digest.clone(), Arc::clone(&schemas));
-            schemas
-        };
-        if schemas.kind != entry.plugin {
+        let cell = self.cell(&digest);
+        let schemas = cell
+            .get_or_try_init(|| async {
+                let _permit = self
+                    .probes
+                    .acquire()
+                    .await
+                    .expect("the probe semaphore is never closed");
+                let schemas = probe(entry, &path, &self.limits).await?;
+                // A replacement during the probe must not be cached under
+                // the digest that was trusted.
+                if self::digest(entry, &path).await? != digest {
+                    return Err(invalid_config(
+                        entry,
+                        "path",
+                        "plugin executable changed during discovery",
+                    ));
+                }
+                Ok(Arc::new(schemas))
+            })
+            .await?
+            .clone();
+        if schemas.kind != location.kind {
             return Err(invalid_config(
-                name,
+                entry,
                 "plugin",
-                "discovered kind does not match the configured plugin",
+                &format!(
+                    "the executable serves kind {}, not the configured {}",
+                    schemas.kind, location.kind
+                ),
             ));
         }
         Ok(DiscoveredPlugin {
@@ -185,6 +173,25 @@ impl SchemaDiscovery {
             schemas,
             verified: matches!(trust, PluginTrust::Sha256 { .. }),
         })
+    }
+
+    /// The shared probe slot for one digest. The oldest digest is evicted
+    /// beyond the cache budget; a caller already waiting keeps its slot.
+    fn cell(&self, digest: &Sha256Digest) -> Probe {
+        let mut cache = self.cache.lock().expect("metadata cache lock");
+        if let Some(cell) = cache.entries.get(digest) {
+            return Arc::clone(cell);
+        }
+        while cache.entries.len() >= self.limits.cached_binaries {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            cache.entries.remove(&oldest);
+        }
+        let cell = Probe::default();
+        cache.entries.insert(digest.clone(), Arc::clone(&cell));
+        cache.order.push_back(digest.clone());
+        cell
     }
 }
 
@@ -199,6 +206,7 @@ pub struct DiscoveredPlugin {
 }
 
 impl DiscoveredPlugin {
+    /// The canonical executable path.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -216,42 +224,84 @@ impl DiscoveredPlugin {
 
     /// Recheck immediately before runtime launch. A replacement must go
     /// through discovery and trust verification again, even in development.
-    pub async fn verify_unchanged(&self) -> Result<(), Error> {
-        if digest(&self.path).await? != self.digest {
-            return Err(unavailable(
+    pub async fn verify_unchanged(&self, entry: &ProviderName) -> Result<(), Error> {
+        if digest(entry, &self.path).await? != self.digest {
+            return Err(invalid_config(
+                entry,
+                "path",
                 "plugin executable changed since metadata discovery",
             ));
         }
         Ok(())
     }
-
-    /// Initialization must agree with discovery before any sandbox call.
-    /// Namespace/capabilities are live facts, not cached metadata.
-    pub fn check_descriptor(&self, descriptor: &Descriptor) -> Result<(), Error> {
-        if descriptor.schemas != *self.schemas {
-            return Err(Error::Transport {
-                message: "initialized plugin metadata differs from discovery".into(),
-                outcome: MutationOutcome::NotStarted,
-            });
-        }
-        Ok(())
-    }
 }
 
-async fn digest(path: &Path) -> Result<Sha256Digest, Error> {
+/// The configured executable, canonicalized. New-contract entries name an
+/// absolute path; there is no search of the caller's ambient `PATH`.
+async fn resolve(location: &PluginLocation) -> Result<PathBuf, Error> {
+    let entry = &location.entry;
+    let configured = location
+        .path
+        .as_deref()
+        .ok_or_else(|| invalid_config(entry, "path", "a plugin entry must name its executable"))?;
+    let configured = Path::new(configured);
+    if !configured.is_absolute() {
+        return Err(invalid_config(
+            entry,
+            "path",
+            &format!(
+                "plugin path {} must be absolute; expand ~ before configuring it",
+                configured.display()
+            ),
+        ));
+    }
+    let missing = |reason: &str| {
+        invalid_config(
+            entry,
+            "path",
+            &format!("plugin executable {} {reason}", configured.display()),
+        )
+    };
+    let path = fs::canonicalize(configured)
+        .await
+        .map_err(|_| missing("does not exist or is not accessible"))?;
+    let metadata = fs::metadata(&path)
+        .await
+        .map_err(|_| missing("is not accessible"))?;
+    if !metadata.is_file() {
+        return Err(missing("is not a file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(missing("is not executable"));
+        }
+    }
+    Ok(path)
+}
+
+async fn digest(entry: &ProviderName, path: &Path) -> Result<Sha256Digest, Error> {
     let hash = file_sha256(path)
         .await
-        .map_err(|_| unavailable("cannot read plugin executable"))?;
+        .map_err(|_| unavailable(entry, "cannot read plugin executable"))?;
     Ok(Sha256Digest::try_new(hash).expect("SHA-256 produces a valid digest"))
 }
 
-async fn probe(path: &Path, limits: &DiscoveryLimits) -> Result<ProviderSchemas, Error> {
+async fn probe(
+    entry: &ProviderName,
+    path: &Path,
+    limits: &DiscoveryLimits,
+) -> Result<ProviderSchemas, Error> {
     let mut command = Command::new(path);
     command.arg("--describe-schema").env_clear();
     // No HOME, user-configurable PATH, loader injection variables, or runtime
     // settings. A native executable needs no credential-bearing environment.
     #[cfg(unix)]
-    command.env("PATH", "/usr/bin:/bin");
+    command
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .process_group(0);
     #[cfg(windows)]
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
@@ -263,43 +313,77 @@ async fn probe(path: &Path, limits: &DiscoveryLimits) -> Result<ProviderSchemas,
         .kill_on_drop(true);
     let mut child = command
         .spawn()
-        .map_err(|_| unavailable("cannot start plugin metadata probe"))?;
+        .map_err(|_| unavailable(entry, "cannot start plugin metadata probe"))?;
+    // Descendants may hold the pipes after the probe itself exits. Dropping
+    // the guard (on return, timeout or cancellation) kills the whole group.
+    let _group = child.id().map(ProcessGroup);
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     // Poll pipes concurrently with wait: neither a noisy stderr nor a child
-    // retaining stdout can deadlock discovery. Drop/timeout kills the child;
-    // Tokio owns reaping. No detached output collection tasks survive it.
-    let (stdout, _, status) = tokio::try_join!(
-        read_bounded(stdout, limits.stdout_bytes),
-        read_bounded(stderr, limits.stderr_bytes),
+    // retaining stdout can deadlock discovery.
+    let (stdout, stderr, status) = tokio::try_join!(
+        read_bounded(entry, stdout, limits.stdout_bytes),
+        read_bounded(entry, stderr, limits.stderr_bytes),
         async {
             child
                 .wait()
                 .await
-                .map_err(|_| unavailable("cannot reap metadata probe"))
+                .map_err(|_| unavailable(entry, "cannot reap metadata probe"))
         },
     )?;
     if !status.success() {
-        return Err(unavailable("plugin metadata probe exited unsuccessfully"));
+        // The probe holds no credentials, so its diagnostics may be logged;
+        // they never enter the error, which callers may show or persist.
+        tracing::warn!(
+            provider_entry = %entry,
+            stderr = %String::from_utf8_lossy(&stderr),
+            "plugin metadata probe failed"
+        );
+        return Err(unavailable(
+            entry,
+            "plugin metadata probe exited unsuccessfully",
+        ));
     }
-    // Do not echo plugin stdout/stderr or serde errors (which can quote input).
-    serde_json::from_slice(&stdout)
-        .map_err(|_| unavailable("plugin metadata probe did not return one ProviderSchemas object"))
+    // Do not echo plugin stdout or serde errors (which can quote input).
+    serde_json::from_slice(&stdout).map_err(|_| {
+        unavailable(
+            entry,
+            "plugin metadata probe did not return one ProviderSchemas object",
+        )
+    })
 }
 
-async fn read_bounded(mut reader: impl AsyncRead + Unpin, max: usize) -> Result<Vec<u8>, Error> {
+/// Kills a probe's process group, including descendants that outlive it.
+struct ProcessGroup(u32);
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.0) {
+            // ESRCH (already gone) is the common, successful case.
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
+async fn read_bounded(
+    entry: &ProviderName,
+    mut reader: impl AsyncRead + Unpin,
+    max: usize,
+) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     let mut buffer = vec![0; 8192];
     loop {
         let count = reader
             .read(&mut buffer)
             .await
-            .map_err(|_| unavailable("cannot read metadata probe output"))?;
+            .map_err(|_| unavailable(entry, "cannot read metadata probe output"))?;
         if count == 0 {
             return Ok(bytes);
         }
         if count > max.saturating_sub(bytes.len()) {
             return Err(unavailable(
+                entry,
                 "plugin metadata probe output exceeded its budget",
             ));
         }
@@ -315,17 +399,17 @@ pub fn write_schema(mut writer: impl Write, schemas: &ProviderSchemas) -> io::Re
     writer.flush()
 }
 
-fn invalid_config(name: &ProviderName, path: &str, message: &str) -> Error {
+fn invalid_config(entry: &ProviderName, path: &str, message: &str) -> Error {
     Error::InvalidConfig {
-        entry:   name.clone(),
+        entry:   entry.clone(),
         path:    path.into(),
         message: message.into(),
     }
 }
 
-fn unavailable(message: &str) -> Error {
+fn unavailable(entry: &ProviderName, message: &str) -> Error {
     Error::Unavailable {
-        message: message.into(),
+        message: format!("provider entry {entry}: {message}"),
         outcome: MutationOutcome::NotStarted,
     }
 }

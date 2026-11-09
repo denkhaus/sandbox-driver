@@ -321,9 +321,9 @@ behavior before any consumer cutover or legacy removal.
 
 The additive provider boundary is exported from `sandbox_driver::contract`:
 
-- `ProviderFactory::discover(&PluginLocation)` receives only kind, path and
-  trust. The plugin adapter owns verification, bounded credential-free probing,
-  and caching by verified digest. Built-in factories return metadata directly.
+- `ProviderFactory::discover(&PluginLocation)` receives only the entry name
+  (for errors), kind, path and trust. The plugin adapter owns verification,
+  bounded credential-free probing, and caching by verified digest. Built-in factories return metadata directly.
 - `ProviderFactory::activate(Activation)` receives the selected entry name,
   frozen connection/launch configuration, discovered schemas, resolved launch
   environment and separate redacted `SecretValues`. It returns an

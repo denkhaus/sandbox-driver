@@ -49,8 +49,10 @@ impl fmt::Debug for SecretValues {
 
 /// Only these inputs may reach credential-free metadata discovery. Runtime
 /// config, arguments, environment and secrets are intentionally absent.
+/// `entry` only names the selected entry in errors.
 #[derive(Clone, Debug)]
 pub struct PluginLocation {
+    pub entry: ProviderName,
     pub kind:  ProviderKind,
     pub path:  Option<String>,
     pub trust: Option<PluginTrust>,

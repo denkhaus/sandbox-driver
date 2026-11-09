@@ -440,6 +440,7 @@ impl ProviderHandle {
         })?;
         let metadata = factory
             .discover(&PluginLocation {
+                entry: self.entry.name.clone(),
                 kind:  entry.plugin.clone(),
                 path:  entry.path.clone(),
                 trust: entry.trust.clone(),
