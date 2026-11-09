@@ -25,6 +25,17 @@ pub(crate) enum Reply {
 
 pub(crate) type Script = Arc<dyn Fn(&str, &str) -> Reply + Send + Sync>;
 
+/// Sandbox `sb-1` in `state`, with every field the SDK requires to parse it.
+pub(crate) fn sandbox_json(state: &str) -> String {
+    serde_json::json!({
+        "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
+        "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
+        "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
+        "state": state, "toolboxProxyUrl": "http://unused",
+    })
+    .to_string()
+}
+
 /// The Daytona control plane and one sandbox's toolbox on a local
 /// socket: enough HTTP/1.1 for the SDK clients, every request
 /// recorded, and one route allowed to hang until the client goes away.
@@ -125,14 +136,21 @@ impl FakeDaytona {
     }
 
     pub(crate) async fn transport(&self) -> DaytonaTransport {
-        let client = Client::new_with_config(DaytonaConfig {
+        DaytonaTransport::new(
+            Arc::new(self.client().await),
+            "sb-1".to_owned(),
+            "/workspace".to_owned(),
+        )
+    }
+
+    pub(crate) async fn client(&self) -> Client {
+        Client::new_with_config(DaytonaConfig {
             api_key: Some("test-key".to_owned()),
             api_url: Some(format!("http://{}", self.address)),
             ..DaytonaConfig::default()
         })
         .await
-        .expect("client");
-        DaytonaTransport::new(Arc::new(client), "sb-1".to_owned(), "/workspace".to_owned())
+        .expect("client")
     }
 
     pub(crate) fn requests(&self) -> Vec<String> {

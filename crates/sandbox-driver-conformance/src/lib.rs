@@ -30,6 +30,7 @@ use tokio::time;
 use crate::check::{CheckFn, CheckOutcome, Verdict, fail, require_on};
 
 mod check;
+pub mod contract;
 mod exec;
 mod exec_stop;
 mod exec_streaming;

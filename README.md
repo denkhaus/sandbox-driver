@@ -37,8 +37,13 @@ package. The Docker library is reused inside Daytona for nested Docker.
 same path a third-party plugin does.
 
 Host and Docker pass conformance locally (Docker needs a daemon), in
-process and served over the plugin wire; the Daytona suite runs live with
-`DAYTONA_API_KEY` set.
+process and served over the plugin wire. The Daytona suite talks to the live
+service, so the routine checks ignore it; run it explicitly with
+`DAYTONA_API_KEY` set:
+
+```sh
+mise run test:live
+```
 
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.

@@ -12,7 +12,9 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 globset.workspace = true
+futures-util.workspace = true
 humantime.workspace = true
+jsonschema.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +22,8 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 tracing.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
+sandbox-driver-testing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

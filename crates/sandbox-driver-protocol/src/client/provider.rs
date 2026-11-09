@@ -224,6 +224,7 @@ impl PluginProvider {
             .child
             .as_ref()
             .and_then(|slot| slot.lock().expect("child lock").take());
+        self.client.shutdown_requested.store(true, Ordering::SeqCst);
         let outcome = time::timeout(self.client.limits.shutdown_timeout, async {
             let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
             if let Some(child) = &mut child {

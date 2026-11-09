@@ -1,6 +1,7 @@
 //! Deep live exercise of the Daytona provider: the positive paths the
 //! conformance suite only presence-checks. Requires a full-access
-//! `DAYTONA_API_KEY`; skipped otherwise. Every resource this test
+//! `DAYTONA_API_KEY`; ignored by default and run with
+//! `mise run test:live`. Every resource this test
 //! creates is deleted before it returns, on success and failure paths.
 
 use std::collections::BTreeMap;
@@ -73,10 +74,9 @@ fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn requested_working_directory_is_created_and_survives_attach() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let working_directory = format!("/home/daytona/{}", unique("sd-working-directory"));
@@ -188,10 +188,9 @@ async fn requested_working_directory_is_created_and_survives_attach() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let working_directory = format!("/home/daytona/{}", unique("sd-hybrid-git"));
@@ -272,10 +271,9 @@ async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn labels_timers_access_round_trip() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -379,10 +377,9 @@ async fn labels_timers_access_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn wall_clock_ttl_and_container_auto_pause_behavior() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -423,14 +420,13 @@ async fn wall_clock_ttl_and_container_auto_pause_behavior() {
 /// rather than asserting zero (the toolbox decides that, not the driver).
 /// A lossless run must decode exactly, which pins the two-encoder path.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 #[expect(
     clippy::print_stderr,
     reason = "the observed loss per run is the test's evidence"
 )]
 async fn fast_progress_output_completes_and_reports_loss() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -590,10 +586,9 @@ async fn run_fast(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn cidr_egress_limits_apply_at_create_and_runtime() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -653,10 +648,9 @@ async fn tcp_probe(sandbox: &dyn sandbox_driver::Sandbox) -> Result<String, Stri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn stop_resize_archive_restore_lifecycle() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     // Non-ephemeral: an ephemeral sandbox deletes itself on stop, and
@@ -758,23 +752,25 @@ async fn stop_resize_archive_restore_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     // An explicit VM verification must fail when access is unavailable.
     let require_vm = env::var("SANDBOX_DRIVER_DAYTONA_REQUIRE_VM").as_deref() == Ok("1");
-    if env::var("DAYTONA_API_KEY").is_err() {
-        assert!(!require_vm, "VM verification requires DAYTONA_API_KEY");
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
-    let vm_snapshot_spec = SnapshotSpec::new(SnapshotSource::Image {
+    // Leave the region to the backend unless this account supplies a VM region.
+    let vm_region = env::var("SANDBOX_DRIVER_DAYTONA_VM_REGION")
+        .or_else(|_| env::var("DAYTONA_TARGET"))
+        .ok();
+    let mut vm_snapshot_spec = SnapshotSpec::new(SnapshotSource::Image {
         reference: "ubuntu:24.04".to_owned(),
     })
     .name(unique("sd-live-vm-base"))
     .sandbox_kind(SandboxKind::VirtualMachine)
-    .region("us-central-1")
     .resources(snapshot_resources(3072));
+    vm_snapshot_spec.region.clone_from(&vm_region);
     let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec, None).await {
         Ok(id) => id,
         Err(error)
@@ -800,12 +796,12 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         let _ = snapshots.delete(&vm_snapshot_id, None).await;
         panic!("VM snapshot did not become active: {error}");
     }
-    let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
+    let mut source_spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: vm_snapshot_id.clone(),
     })
     .name(unique("sd-live-vm-state"))
-    .sandbox_kind(SandboxKind::VirtualMachine)
-    .region("us-central-1");
+    .sandbox_kind(SandboxKind::VirtualMachine);
+    source_spec.region.clone_from(&vm_region);
     let source = match provider.create(&source_spec, None).await {
         Ok(source) => source,
         Err(error) => {
@@ -831,7 +827,9 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
             .await
             .map_err(|error| format!("describe VM: {error}"))?;
         if source_status.sandbox_kind != Some(SandboxKind::VirtualMachine)
-            || source_status.region.as_deref() != Some("us-central-1")
+            || vm_region
+                .as_ref()
+                .is_some_and(|region| source_status.region.as_ref() != Some(region))
         {
             return Err(format!(
                 "VM status did not preserve kind and region: {source_status:?}"
@@ -875,7 +873,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         let mut hot_restore_spec = SandboxSpec::new(SandboxSource::Snapshot { id: hot_id.clone() })
             .sandbox_kind(SandboxKind::VirtualMachine)
             .ephemeral(true);
-        hot_restore_spec.region = Some("us-central-1".to_owned());
+        hot_restore_spec.region.clone_from(&source_status.region);
         let hot_restore = provider
             .create(&hot_restore_spec, None)
             .await
@@ -927,7 +925,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         })
         .sandbox_kind(SandboxKind::VirtualMachine)
         .ephemeral(true);
-        cold_restore_spec.region = Some("us-central-1".to_owned());
+        cold_restore_spec.region.clone_from(&source_status.region);
         let cold_restore = provider
             .create(&cold_restore_spec, None)
             .await
@@ -935,16 +933,12 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         created_sandboxes.push(Arc::clone(&cold_restore));
         let cold_check = cold_restore
             .exec()
-            .run(
-                &ExecSpec::bash(
-                    "test \"$(cat /tmp/sd-state-marker)\" = preserved; \
-                     pid=$(cat /tmp/sd-state-pid); \
-                     if test -r \"/proc/$pid/cmdline\" && \
-                        tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
-                        grep -q sandbox-driver-live-process; then exit 23; fi",
-                )
-                .timeout(Duration::from_secs(30)),
-            )
+            .run(&snapshot_probe(
+                "/tmp/sd-state-marker",
+                "/tmp/sd-state-pid",
+                "sandbox-driver-live-process",
+                "cold",
+            ))
             .await
             .map_err(|error| format!("check filesystem snapshot: {error}"))?;
         if !cold_check.success() {
@@ -967,10 +961,9 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn filesystem_snapshot_restores_files_without_processes() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -1051,16 +1044,12 @@ async fn filesystem_snapshot_restores_files_without_processes() {
         restored = Some(Arc::clone(&sandbox));
         let check = sandbox
             .exec()
-            .run(
-                &ExecSpec::bash(
-                    "test \"$(cat /tmp/sd-cold-marker)\" = preserved; \
-                     pid=$(cat /tmp/sd-cold-pid); \
-                     if test -r \"/proc/$pid/cmdline\" && \
-                        tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
-                        grep -q sandbox-driver-cold-process; then exit 23; fi",
-                )
-                .timeout(Duration::from_secs(30)),
-            )
+            .run(&snapshot_probe(
+                "/tmp/sd-cold-marker",
+                "/tmp/sd-cold-pid",
+                "sandbox-driver-cold-process",
+                "cold",
+            ))
             .await
             .map_err(|error| format!("check restored filesystem snapshot: {error}"))?;
         if !check.success() {
@@ -1082,22 +1071,32 @@ async fn filesystem_snapshot_restores_files_without_processes() {
     outcome.expect("filesystem snapshot behavior");
 }
 
+fn snapshot_probe(marker: &str, pid: &str, process: &str, mode: &str) -> ExecSpec {
+    ExecSpec::new("bash")
+        .args([
+            "-c",
+            include_str!("support/snapshot_state.sh"),
+            "snapshot-probe",
+            marker,
+            pid,
+            process,
+            mode,
+        ])
+        .timeout(Duration::from_secs(30))
+}
+
 async fn assert_live_process(
     sandbox: &dyn sandbox_driver::Sandbox,
     expected_pid: &str,
 ) -> Result<(), String> {
     let result = sandbox
         .exec()
-        .run(
-            &ExecSpec::bash(
-                "pid=$(cat /tmp/sd-state-pid); \
-                 test -r \"/proc/$pid/cmdline\"; \
-                 tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
-                 grep -q sandbox-driver-live-process; \
-                 printf '%s %s' \"$pid\" \"$(cat /tmp/sd-state-marker)\"",
-            )
-            .timeout(Duration::from_secs(30)),
-        )
+        .run(&snapshot_probe(
+            "/tmp/sd-state-marker",
+            "/tmp/sd-state-pid",
+            "sandbox-driver-live-process",
+            "live",
+        ))
         .await
         .map_err(|error| format!("check live process: {error}"))?;
     let expected = format!("{expected_pid} preserved");
@@ -1112,10 +1111,9 @@ async fn assert_live_process(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn snapshot_provider_round_trip() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
@@ -1224,10 +1222,9 @@ async fn snapshot_provider_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn dockerfile_snapshot_build_and_entrypoint_logs() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
@@ -1466,10 +1463,9 @@ async fn stdin_delivers_exact_bytes(sandbox: &dyn Sandbox) -> Result<(), String>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DAYTONA_API_KEY; run with `mise run test:live`"]
 async fn streamed_stdin_is_interactive_exact_and_ends_at_eof() {
-    if env::var("DAYTONA_API_KEY").is_err() {
-        return;
-    }
+    env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {

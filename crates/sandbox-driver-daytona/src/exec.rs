@@ -863,7 +863,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
-    use crate::fake_daytona::{FakeDaytona, Reply, Script};
+    use crate::fake_daytona::{FakeDaytona, Reply, Script, sandbox_json};
 
     #[test]
     fn wire_timeout_rounds_sub_second_up() {
@@ -955,16 +955,9 @@ mod tests {
                 ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
                     Reply::Json(200, format!(r#"{{"url":"http://{address}/toolbox"}}"#))
                 }
-                ("GET", target) if target.starts_with("/sandbox/sb-1") => Reply::Json(
-                    200,
-                    serde_json::json!({
-                        "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
-                        "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
-                        "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
-                        "toolboxProxyUrl": "http://unused", "state": "started",
-                    })
-                    .to_string(),
-                ),
+                ("GET", target) if target.starts_with("/sandbox/sb-1") => {
+                    Reply::Json(200, sandbox_json("started"))
+                }
                 ("POST", "/toolbox/sb-1/process/session") => Reply::Json(201, "{}".to_owned()),
                 ("POST", target) if target.ends_with("/exec") => Reply::Json(
                     200,

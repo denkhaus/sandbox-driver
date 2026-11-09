@@ -15,6 +15,9 @@
 //! Tests that need real files and processes use the Host provider on a
 //! temporary directory instead.
 
+/// In-memory provider for the additive shared sandbox contract.
+pub mod contract;
+
 mod exec;
 mod fs;
 mod provider;

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 
 use super::units::{Mib, Millis};
-use super::{Error, NetworkMode};
+use super::{ContainerField, Error, NetworkMode, ResourceCapability, SourceKind, TimerCapability};
 use crate::id::validate_label;
 use crate::redact::EnvKeys;
 use crate::{SnapshotId, WorkspaceOwnership};
@@ -35,6 +35,17 @@ impl fmt::Debug for Source {
     }
 }
 
+impl Source {
+    pub(super) fn kind(&self) -> SourceKind {
+        match self {
+            Self::Image(_) => SourceKind::Image,
+            Self::Dockerfile(_) => SourceKind::Dockerfile,
+            Self::Snapshot(_) => SourceKind::Snapshot,
+            Self::HostDirectory => SourceKind::HostDirectory,
+        }
+    }
+}
+
 /// Resource requests in whole cores and MiB. Decoding also accepts the
 /// template spelling, `cpu = 2` and `memory = "4GB"`, through the one size
 /// grammar; the value is normalized once and always serializes as MiB, so
@@ -49,6 +60,50 @@ pub struct Resources {
     #[serde(alias = "disk", deserialize_with = "size_mib")]
     pub disk_mb:   Option<NonZeroU64>,
     pub gpus:      Option<u32>,
+}
+
+impl Resources {
+    /// Capabilities this request needs, with their spec paths. Destructuring
+    /// makes every new field declare its capability here.
+    pub(super) fn requested(&self) -> impl Iterator<Item = (ResourceCapability, &'static str)> {
+        let Self {
+            cpu_cores,
+            memory_mb,
+            disk_mb,
+            gpus,
+        } = self;
+        set_fields([
+            (
+                cpu_cores.is_some(),
+                ResourceCapability::Cpu,
+                "resources.cpu_cores",
+            ),
+            (
+                memory_mb.is_some(),
+                ResourceCapability::Memory,
+                "resources.memory_mb",
+            ),
+            (
+                disk_mb.is_some(),
+                ResourceCapability::Disk,
+                "resources.disk_mb",
+            ),
+            (
+                gpus.is_some_and(|count| count != 0),
+                ResourceCapability::Gpus,
+                "resources.gpus",
+            ),
+        ])
+    }
+}
+
+/// Keeps the capabilities whose field is set.
+fn set_fields<C, const N: usize>(
+    fields: [(bool, C, &'static str); N],
+) -> impl Iterator<Item = (C, &'static str)> {
+    fields
+        .into_iter()
+        .filter_map(|(set, capability, path)| set.then_some((capability, path)))
 }
 
 fn size_mib<'de, D: de::Deserializer<'de>>(
@@ -114,6 +169,20 @@ impl TryFrom<RawNetworkPolicy> for NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// The capability this policy needs, with its spec path. Every provider
+    /// honours its own default, so the default requests nothing, whether the
+    /// field is omitted or explicit.
+    pub(super) fn requested(&self) -> Option<(NetworkMode, &'static str)> {
+        let mode = match self {
+            Self::ProviderDefault => return None,
+            Self::AllowAll => NetworkMode::AllowAll,
+            Self::Block => NetworkMode::Block,
+            Self::CidrAllowList { .. } => NetworkMode::CidrAllowList,
+            Self::DomainAllowList { .. } => NetworkMode::DomainAllowList,
+        };
+        Some((mode, "network"))
+    }
+
     /// Rejects an empty allow-list: providers treat it as no restriction, the
     /// opposite of what an emptied-out filter intends.
     pub fn validate(&self) -> Result<(), Error> {
@@ -143,6 +212,37 @@ pub struct Timers {
     pub auto_delete_ms:  Option<u64>,
     #[serde(alias = "ttl", deserialize_with = "duration_ms")]
     pub ttl_ms:          Option<u64>,
+}
+
+impl Timers {
+    /// Capabilities this request needs, with their spec paths. Zero disables a
+    /// timer, which is still a request.
+    pub(super) fn requested(&self) -> impl Iterator<Item = (TimerCapability, &'static str)> {
+        let Self {
+            auto_stop_ms,
+            auto_archive_ms,
+            auto_delete_ms,
+            ttl_ms,
+        } = self;
+        set_fields([
+            (
+                auto_stop_ms.is_some(),
+                TimerCapability::AutoStop,
+                "timers.auto_stop_ms",
+            ),
+            (
+                auto_archive_ms.is_some(),
+                TimerCapability::AutoArchive,
+                "timers.auto_archive_ms",
+            ),
+            (
+                auto_delete_ms.is_some(),
+                TimerCapability::AutoDelete,
+                "timers.auto_delete_ms",
+            ),
+            (ttl_ms.is_some(), TimerCapability::Ttl, "timers.ttl_ms"),
+        ])
+    }
 }
 
 /// Portable workload declaration. This unvalidated DTO is deliberately
@@ -247,9 +347,9 @@ impl SandboxSpec {
 
 /// Environment keys become `KEY=VALUE` pairs, so `=` and NUL would change or
 /// truncate the variable that reaches the workload.
-fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
+pub(super) fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
     for (key, value) in env {
-        if key.is_empty() || key.contains(['=', '\0']) {
+        if !valid_env_key(key) {
             return Err(Error::invalid_spec(
                 path,
                 "keys must be non-empty and must not contain '=' or NUL",
@@ -258,6 +358,31 @@ fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error>
         if value.contains('\0') {
             return Err(Error::invalid_spec(path, "values must not contain NUL"));
         }
+    }
+    Ok(())
+}
+
+pub(super) fn valid_env_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains(['=', '\0'])
+}
+
+/// Argv is executed without a shell: the executable must be named, and NUL
+/// would truncate an argument.
+pub(super) fn validate_argv(path: &str, argv: &[String]) -> Result<(), Error> {
+    if argv.first().is_none_or(String::is_empty) {
+        return Err(Error::invalid_spec(path, "requires a non-empty executable"));
+    }
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        return Err(Error::invalid_spec(path, "arguments must not contain NUL"));
+    }
+    Ok(())
+}
+
+/// Paths, references and entrypoints reach the backend as C strings, so an
+/// empty value names nothing and NUL would truncate it.
+pub(super) fn validate_name(path: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.contains('\0') {
+        return Err(Error::invalid_spec(path, "must be non-empty and NUL-free"));
     }
     Ok(())
 }
@@ -387,18 +512,7 @@ pub struct ReadinessCheck {
 impl ReadinessCheck {
     /// `path` locates this check in the enclosing spec's error paths.
     fn validate(&self, path: &str) -> Result<(), Error> {
-        if self.command.first().is_none_or(String::is_empty) {
-            return Err(Error::invalid_spec(
-                format!("{path}.command"),
-                "requires a non-empty executable",
-            ));
-        }
-        if self.command.iter().any(|arg| arg.contains('\0')) {
-            return Err(Error::invalid_spec(
-                format!("{path}.command"),
-                "arguments must not contain NUL",
-            ));
-        }
+        validate_argv(&format!("{path}.command"), &self.command)?;
         if self.timeout_ms > self.deadline_ms {
             return Err(Error::invalid_spec(
                 format!("{path}.timeout_ms"),
@@ -450,6 +564,50 @@ pub struct ContainerSpec {
 }
 
 impl ContainerSpec {
+    /// Fields this request sets, with their spec paths. An explicit `false`
+    /// is still a request. Destructuring makes every new field declare its
+    /// capability here.
+    pub(super) fn requested(&self) -> impl Iterator<Item = (ContainerField, &'static str)> {
+        let Self {
+            init,
+            privileged,
+            capabilities_add,
+            capabilities_drop,
+            dns,
+            extra_hosts,
+            shm_size_mb,
+        } = self;
+        set_fields([
+            (init.is_some(), ContainerField::Init, "container.init"),
+            (
+                privileged.is_some(),
+                ContainerField::Privileged,
+                "container.privileged",
+            ),
+            (
+                !capabilities_add.is_empty(),
+                ContainerField::CapabilitiesAdd,
+                "container.capabilities_add",
+            ),
+            (
+                !capabilities_drop.is_empty(),
+                ContainerField::CapabilitiesDrop,
+                "container.capabilities_drop",
+            ),
+            (!dns.is_empty(), ContainerField::Dns, "container.dns"),
+            (
+                !extra_hosts.is_empty(),
+                ContainerField::ExtraHosts,
+                "container.extra_hosts",
+            ),
+            (
+                shm_size_mb.is_some(),
+                ContainerField::ShmSizeMb,
+                "container.shm_size_mb",
+            ),
+        ])
+    }
+
     /// `path` locates these options in the enclosing spec's error paths.
     fn validate(&self, path: &str) -> Result<(), Error> {
         for (field, entries) in [

@@ -47,8 +47,13 @@ run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 
 [tasks."test:cli"]
 depends = ["plugins:build"]
-description = "Run CLI black-box tests, including available live providers"
+description = "Run CLI black-box tests, including Docker when its daemon is reachable"
 run = "cargo nextest run --locked -p sandbox-driver-cli --test trycmd --test live --test plugins"
+
+[tasks."test:live"]
+depends = ["plugins:build"]
+description = "Run the live Daytona tests; requires DAYTONA_API_KEY and creates real resources"
+run = "cargo nextest run --locked --run-ignored only -E '(package(sandbox-driver-daytona) - binary(nested_docker) - binary(spawned_conformance)) | (package(sandbox-driver-cli) & binary(live))'"
 
 [tasks."coverage:cli"]
 description = "Measure full-stack CLI black-box coverage with live providers required"

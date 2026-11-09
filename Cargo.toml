@@ -20,6 +20,7 @@ futures-util = "0.3"
 globset = "0.4"
 http = "1"
 humantime = "2"
+jsonschema = { version = "=0.42.2", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 nix = { version = "0.30", features = ["signal"] }

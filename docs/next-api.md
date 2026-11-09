@@ -16,10 +16,13 @@ One interface to any sandbox. Clients name an environment; providers own the san
 ```rust
 // Shared by requests within the Fabro server process.
 // Worker processes construct their own instance from resolved configuration.
-let sandboxes = Sandboxes::try_new(&settings.sandbox.providers, &environments).await?;
+let sandboxes = Sandboxes::try_new(
+    settings.sandbox.providers.clone(), environments, &registry, credentials,
+    CatalogOptions::default(),
+)?;
 
 // A run starts on the "cloud" environment.
-let sandbox = sandboxes.builder("cloud-linux-xl")?            // seeded from the environment's template
+let sandbox = sandboxes.builder("cloud-linux-xl").await?            // seeded from the environment's template
     .label("fabro.run", &run.id)
     .create()
     .await?;
@@ -58,7 +61,7 @@ Fabro keeps provider entries in its server settings and environments in its data
 Everything in the template rides along on `create()`. A caller that needs something different for one sandbox overrides it on the builder, and the provider validates the override against what it supports:
 
 ```rust
-let sandbox = sandboxes.builder("cloud")?.memory("8GB").create().await?;
+let sandbox = sandboxes.builder("cloud").await?.memory("8GB").create().await?;
 ```
 
 Clients pass the environment name and never the provider's. Whether `cloud` points at the built-in Daytona provider, the built-in Docker one, or a plugin someone wrote last week, the code above is the same.
@@ -96,18 +99,22 @@ Kind names (`docker`, `daytona`, `lima`) appear in provider entries and nowhere 
 pub struct Sandboxes { /* private */ }
 
 impl Sandboxes {
-    /// Validates every provider entry, resolves its secrets, and starts nothing.
-    pub async fn try_new(
+    /// Checks local structure only. Discovery, secrets and activation are lazy per entry.
+    pub fn try_new(
         providers: impl IntoIterator<Item = (ProviderName, ProviderEntry)>,
-        environments: impl EnvironmentSource + 'static,
+        environments: Arc<dyn EnvironmentSource>,
+        registry: &Registry,
+        credentials: Arc<dyn SecretResolver>,
+        options: CatalogOptions,
     ) -> Result<Self, Error>;
     /// Both levels from one file (the CLI, a bare Petri run).
-    pub async fn from_config_file(path: &Path) -> Result<Self, Error>;
-    /// In-memory, for tests.
-    pub fn fake() -> Self;
+    pub async fn from_config_file(
+        path: &Path, registry: &Registry, credentials: Arc<dyn SecretResolver>,
+        options: CatalogOptions,
+    ) -> Result<Self, Error>;
 
     // Sandboxes
-    pub fn builder(&self, environment: &str) -> Result<SandboxBuilder, Error>;   // NoEnvironment if unknown
+    pub async fn builder(&self, environment: &str) -> Result<SandboxBuilder, Error>;   // NoEnvironment if unknown
     pub async fn attach(&self, r: &SandboxRef) -> Result<Box<dyn Sandbox>, Error>;
     pub async fn find(&self, filter: LabelFilter) -> Result<Found, Error>;       // across every provider
     pub async fn destroy(&self, r: &SandboxRef) -> Result<(), Error>;
@@ -115,8 +122,8 @@ impl Sandboxes {
     // The catalog
     pub fn providers(&self) -> Vec<ProviderName>;
     pub fn provider(&self, name: &str) -> Result<ProviderHandle, Error>;
-    pub fn environments(&self) -> Vec<EnvironmentName>;
-    pub fn environment(&self, name: &str) -> Result<Environment, Error>;
+    pub async fn environments(&self) -> Result<Vec<EnvironmentName>, Error>;
+    pub async fn environment(&self, name: &str) -> Result<Environment, Error>;
 
     pub async fn shutdown(self) -> Result<(), Error>;
 }
@@ -137,7 +144,8 @@ impl ProviderHandle {
 /// What `find` returns: every match it could reach, and the providers it could not.
 pub struct Found {
     pub sandboxes: Vec<SandboxSummary>,              // reference, name, state, labels
-    pub unavailable: Vec<ProviderName>,              // asked, did not answer; retry later
+    pub unavailable: Vec<ProviderName>,              // every entry whose query failed
+    pub failures: Vec<ProviderFailure>,              // entry plus structured error
 }
 
 #[async_trait]
@@ -175,7 +183,7 @@ A static list and a config file are both `EnvironmentSource`s the library provid
 Rules every method obeys:
 
 1. **Wire-expressible.** Data in, data or an opaque `Sandbox` out. No process handles, file descriptors, closures, or client-local paths. This is what lets the plugin protocol carry a call to a child process and lets the fake serve the same API in memory.
-2. **Identity is the ref.** Nothing else identifies a sandbox. Clients store refs and derive nothing. `attach` resolves a ref by its namespace through any provider entry that reaches it, so renaming or deleting the environment a sandbox was created from does not orphan the sandbox.
+2. **Identity is the ref.** Nothing else identifies a sandbox. Clients store refs and derive nothing. `attach` resolves only the saved provider-entry binding and checks its namespace before dispatch, so renaming or deleting the environment a sandbox was created from does not orphan the sandbox.
 3. **Capabilities are data.** To know whether a sandbox can do something, read the descriptor or check an extension accessor for `Some`. Kind names are never a basis for behavior.
 
 ### Exec
@@ -198,7 +206,7 @@ The three refusals are distinct from `Unavailable` so a client can tell bad cred
 
 ## Configuration
 
-`try_new` takes both levels of the catalog from wherever the client keeps them. Provider entries are operator-owned and rarely change. Environments come from any `EnvironmentSource`: a fixed list, a file, or a live store whose edits are visible on the next use. A client with neither calls `from_config_file`, which reads `~/.config/sandbox-driver/environments.toml` by default (or the file `SANDBOX_DRIVER_CONFIG` names), so tools on one machine can share a catalog. Names at both levels are chosen by the operator; the library ships none.
+`try_new` takes both levels of the catalog from wherever the client keeps them. Provider entries are operator-owned and rarely change. Environments come from any `EnvironmentSource`: a fixed list, a file, or a live store whose edits are visible on the next use. A client with neither calls `from_config_file` with an explicit path (the application may select `~/.config/sandbox-driver/environments.toml` or `SANDBOX_DRIVER_CONFIG`), so tools on one machine can share a catalog. Names at both levels are chosen by the operator; the library ships none.
 
 ```toml
 [providers.docker]
@@ -245,12 +253,12 @@ provider = "lima"
 source = { image = "ubuntu-lts" }
 ```
 
-Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated at construction so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped.
+Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated on first selected-entry activation so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped.
 
 Credentials and conveniences take different paths:
 
-- **`secrets`** names the credentials the entry needs. The library resolves each name once at construction, from the process environment or from a resolver the client supplies (Fabro uses its vault), and an unresolvable name is a `MissingSecret` error naming the entry. Values reach a built-in as configuration and a plugin child as explicit environment. A plugin that accepts one of several credential forms says so in its `config_schema`; the library never guesses.
-- **`inherit_env`** carries conveniences only. Every plugin child starts from an empty environment plus `PATH`, `HOME`, `TMPDIR` and `USER`, plus any names listed here (`RUST_LOG`, say), copied once at construction and frozen for the life of the entry. An unset convenience name is simply not set. `inherit_env = []` yields exactly `env` and the four defaults removed, for operators who want nothing ambient. A value in `env` always wins over an inherited one.
+- **`secrets`** names the credentials the entry needs. The library resolves each name at entry activation through the explicitly supplied resolver (Fabro uses its vault), and an unresolvable name is a `MissingSecret` error naming the entry. Values reach a built-in as configuration and a plugin child as explicit environment. A plugin that accepts one of several credential forms says so in its `config_schema`; the library never guesses.
+- **`inherit_env`** carries conveniences only. Every plugin child starts from an empty environment. An omitted list selects `PATH`, `HOME`, `TMPDIR` and `USER`; an explicit list replaces those defaults. Values are copied from the supplied snapshot and frozen for the life of the entry. An unset convenience name is simply not set. `inherit_env = []` yields exactly explicit `env` and resolved secrets, with no ambient inheritance, for operators who want nothing ambient. A value in `env` always wins over an inherited one.
 - Built-ins read nothing from the ambient environment. Their only inputs are the entry's `config` and resolved `secrets`, which is what makes one process safe to run entries for different owners.
 
 Per environment: `provider` (an entry name) and `spec`, a `SandboxSpec` template the sandbox builder starts from: `source`, `resources`, `network`, `timers`, `labels`, `env`, `working_directory`, `workspace_ownership`, `user`, `services` and `container` (a typed workload description, below), and `provider_config` for the few per-sandbox settings that have no provider-neutral meaning, validated against the provider's `spec_schema` when it declares one. `Environment` and `ProviderEntry` derive `Deserialize`, so a client's own settings types can embed them directly.
@@ -428,7 +436,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 `source` describes the workload the caller wants to execute. Sandbox `exec`, `working_directory`, ambient `env`, and file operations refer to that workload and its workspace, not an outer runner or helper container. A one-shot container uses its own requested image but shares the workload's workspace, network, and service reachability. Any outer runner, nested Docker setup, helper image, or backend-specific job recipe is the provider's responsibility; the caller supplies the same workload spec regardless of provider.
 
 - `resources` are whole cores and MiB. Round up if your backend allocates in coarser units and report the result in `status`. A non-zero `gpus` you cannot provide is `unsupported`, never dropped.
-- `network.mode` is `provider_default`, `allow_all`, `block`, `cidr_allow_list` or `domain_allow_list`; your descriptor's `network` lists which you honour. A mode you do not list is `unsupported`. The two allow-list modes carry their entries under one `allow` key, and an `allow` on any other mode is rejected at decode rather than dropped.
+- `network.mode` is `provider_default`, `allow_all`, `block`, `cidr_allow_list` or `domain_allow_list`; your descriptor's `network` lists which you honour. A mode you do not list is `unsupported`, except `provider_default`, which every provider honours whether listed or not, so a spec without `network` is accepted everywhere. The two allow-list modes carry their entries under one `allow` key, and an `allow` on any other mode is rejected at decode rather than dropped.
 - `timers` are milliseconds. If you do not implement timers, refuse a non-empty `timers` with `unsupported`.
 - `labels` and `env` are string maps and round-trip exactly (labels) or reach every process in the sandbox (env).
 - `working_directory` and `user` are what commands run as and where; return the working directory you actually used in the create result.
@@ -442,7 +450,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 {
   "schemas": {
     "kind": "lima", "version": "0.3.0",
-    "config_schema": {"type": "object", "properties": {"vm_type": {"type": "string"}}},
+    "config_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"vm_type": {"type": "string"}}},
     "spec_schema": null,
     "secrets": []
   },
@@ -473,7 +481,7 @@ Four groups of calls and fields that only some providers can offer. They are def
 - `lifecycle`: a list from `pause`, `resume`, `archive`, `recover`.
 - `endpoints`: a list from `ssh` (`ssh(ttl_ms)`, `ssh_revoke(token)`), `shell_command`, `vnc`.
 - `services`: `true` if `create` accepts the `services` and `container` fields of the spec.
-- `containers`: `true` if you implement `run(sandbox, image | build, argv, env, cwd)`, a one-shot container sharing the workload workspace, network, and service reachability, streamed like exec. Its execution participates in the sandbox stop fence and its resources are removed when it finishes or the sandbox is destroyed.
+- `containers`: `true` if you implement `run(sandbox, image | build, entrypoint, args, env, cwd)`, a one-shot container sharing the workload workspace, network, and service reachability, streamed like exec. `image` is a registry reference. `build` names a context directory in the workload workspace, resolved against the sandbox working directory, so the Dockerfile can copy files beside it; it also takes an optional Dockerfile path within the context, the tag the build produces, which is its cache key, and whether an image already carrying that tag may run without a build. Both forms are part of the capability. Unlike exec, a one-shot runs the image's own command: `entrypoint`, when given, replaces the image's entrypoint, and non-empty `args` replace the image's command, so arguments alone reach the image's entrypoint, as a GitHub Docker action expects. Its execution participates in the sandbox stop fence and its resources are removed when it finishes or the sandbox is destroyed.
 
 Docker and Daytona implement all four. Host implements none: it runs commands as processes in a directory and has nothing to put a service in.
 
@@ -493,8 +501,8 @@ The suite also verifies that exec and files address the requested workload rathe
 
 ## Lifetimes
 
-- `try_new` validates provider entries, resolves their secrets, and starts nothing.
-- A backend exists per provider entry and is cached by the entry's connection and launch settings. Editing an environment touches no backend. Changing an entry's config, path or checksum creates a new backend, and the old one is retired once its sandboxes are released.
+- `try_new` checks local provider-entry structure and freezes launch conveniences; it starts nothing and resolves no secrets. Entry errors are reported when that entry is selected.
+- One backend is activated per immutable provider entry per catalog. Editing an environment touches no backend. Changing connection or launch settings requires a new catalog; shutdown explicitly retires the old catalog.
 - Docker and Daytona run in the caller's process. Nothing is spawned for them, ever.
 - Host is a plugin child like any other, installed separately on the execution machine. It keeps its process-group fence state in a temporary directory it owns, which lasts as long as its sandboxes do, and attempts bounded cleanup of them on stdin EOF; process loss alone is not proof that children died.
 - A third-party plugin child starts on the first call to its entry, one per entry per process, and is supervised. On a crash it is restarted; handles from the old generation return `Error::Stale` and should be re-attached by ref.
@@ -505,10 +513,17 @@ The suite also verifies that exec and files address the requested workload rathe
 ## Testing
 
 ```rust
-let sandboxes = Sandboxes::fake();
+let sandboxes = sandbox_driver_testing::contract::fake();
 ```
 
-The fake serves the full API in memory, passes the conformance suite, and records every call. Clients write their tests against it and keep one integration test per real provider.
+The fake lives in `sandbox-driver-testing`, which consumers add as a
+dev-dependency. It implements the required in-memory lifecycle, identity, files,
+and scripted streaming execution surface. Use `FakeProvider::script` to define
+command responses and `FakeProvider::sandboxes` to retain access to its call log.
+Unscripted commands fail; no command executes on the host. It advertises no
+optional services, container, endpoint, lifecycle-extension or port capabilities.
+The common conformance checks run against it; optional workload and provider
+restart/failure scenarios remain integration gates, not claims made by the fake.
 
 ## CLI
 
@@ -548,3 +563,36 @@ The rules the library holds itself and its clients to. Contributions are reviewe
 Protocol version 3. The crate is pre-1.0 and the public API may change before 1.0.
 
 Prior art: Jupyter kernelspecs and `jupyter_client`, Kubernetes CRI and RuntimeClass, the OCI runtime spec, HashiCorp go-plugin, MCP servers.
+
+### Current additive implementation
+
+`contract::Sandboxes` requires an explicit `Registry`, `SecretResolver` and
+`CatalogOptions`; no real provider is registered by core. `Registry::builtin`
+registers an adapter, and `Registry::plugins` supplies the ordinary plugin
+loader. Host cannot be registered as a built-in. Metadata discovery receives
+only `PluginLocation`, never runtime configuration or secrets.
+
+`builder`, `environment` and `environments` are async because their source may
+be a database. A builder freezes the selected environment and provider binding.
+Field setters override individual template values; map setters merge keys,
+while `spec` explicitly replaces the whole template. Invalid size strings stay
+as admission errors, even if a later setter supplies another value.
+
+Schemas require draft-07, 2019-09 or 2020-12 and are compiled without external
+retrieval, including when another dependency enables the engine's network
+features. Config and spec options are checked separately. Error messages omit
+instance values. Provider validation is still mandatory for opaque options.
+
+Inventory defaults to eight concurrent entries and thirty seconds per entry,
+configurable through `CatalogOptions`. Results and failures have deterministic
+entry/identity ordering. Equal duplicate refs collapse; conflicting duplicate
+refs or foreign refs invalidate that entry's batch. Different entry aliases
+remain different refs. `unavailable` includes all failed entries and `failures`
+retains the structured reason; neither implies absence or authorizes replay.
+
+The common new-contract suite is
+`sandbox_driver_conformance::contract::Conformance`. It accepts a catalog,
+environment, and two command fixtures, and checks identity/inventory, binary
+file ranges and preservation, streamed output, stop/start fencing and confirmed
+cleanup. It reports its executed checks explicitly. Passing it alone is not
+provider-ready certification for optional workloads, crash recovery or transport.

@@ -43,12 +43,7 @@ impl MemoryFs {
 
     /// The absolute sandbox path for `path`.
     pub fn resolve(&self, path: &str) -> String {
-        let joined = if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{path}", self.root.trim_end_matches('/'))
-        };
-        normalize(&joined)
+        resolve(&self.root, path)
     }
 
     /// Seeds a file without recording a write.
@@ -194,6 +189,16 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     let path: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     segments(&pattern, &path)
+}
+
+/// The absolute, dot-free path for `path` resolved against `root`.
+pub(crate) fn resolve(root: &str, path: &str) -> String {
+    let joined = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("{}/{path}", root.trim_end_matches('/'))
+    };
+    normalize(&joined)
 }
 
 fn normalize(path: &str) -> String {

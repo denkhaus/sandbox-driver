@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use daytona_api_client::models::SandboxClass as DaytonaSandboxClass;
@@ -28,14 +28,14 @@ use tokio::time;
 use crate::labels::{MANAGED_LABEL, stored_labels};
 use crate::sandbox::{DaytonaSandbox, status_from_sdk};
 use crate::sdk::{
-    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, is_not_found,
-    map_state, minutes, sandbox_kind_from_class,
+    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, map_state, minutes,
+    sandbox_kind_from_class,
 };
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
 use crate::{
-    CLEANUP_TIMEOUT, CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, LIST_PAGE_SIZE,
-    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, nested, toolbox,
+    CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, FAILED_CREATE_CLEANUP_BUDGET,
+    LIST_PAGE_SIZE, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, cleanup, nested, toolbox,
 };
 
 /// The current-key endpoint includes its effective organization, which the
@@ -269,7 +269,15 @@ impl DaytonaProvider {
         sdk_id: &str,
         budget: Duration,
     ) -> Result<daytona_sdk::Sandbox> {
-        let started = Instant::now();
+        time::timeout(budget, self.poll_started(sdk_id))
+            .await
+            .map_err(|_| Error::Timeout {
+                operation: "creating sandbox".to_owned(),
+                elapsed:   budget,
+            })?
+    }
+
+    async fn poll_started(&self, sdk_id: &str) -> Result<daytona_sdk::Sandbox> {
         let mut attempt = 0_u64;
         loop {
             attempt += 1;
@@ -291,31 +299,22 @@ impl DaytonaProvider {
                 }
                 _ => {}
             }
-            let elapsed = started.elapsed();
-            if elapsed >= budget {
-                return Err(Error::Timeout {
-                    operation: "creating sandbox".to_owned(),
-                    elapsed,
-                });
-            }
             time::sleep(CREATE_POLL).await;
         }
     }
 
-    /// Best-effort delete of a sandbox left behind by a failed create,
-    /// bounded by [`CLEANUP_TIMEOUT`]. When the delete itself fails, the
-    /// id is surfaced in the returned error so the caller can clean up
-    /// later.
+    /// Confirm deletion after a failed create, within one cleanup budget.
+    /// An accepted DELETE only starts cleanup. Retain the sandbox ID and
+    /// original failure if removal cannot be confirmed.
     async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
-        match time::timeout(CLEANUP_TIMEOUT, self.client.delete(sdk_id)).await {
-            Ok(Ok(())) => cause,
-            Ok(Err(error)) if is_not_found(&error) => cause,
-            _ => Error::Provider(ProviderError::with_source(
-                self.kind.clone(),
-                format!("failed create left sandbox {sdk_id} behind"),
-                cause,
-            )),
-        }
+        cleanup::failed_create(
+            &self.client,
+            &self.kind,
+            sdk_id,
+            cause,
+            FAILED_CREATE_CLEANUP_BUDGET,
+        )
+        .await
     }
 
     async fn handle(
@@ -910,6 +909,50 @@ mod tests {
 
     use super::*;
     use crate::labels::{TARGET_LABEL, WORKING_DIRECTORY_LABEL};
+
+    #[tokio::test]
+    async fn stalled_create_observation_times_out_and_cleans_up_the_known_sandbox() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::fake_daytona::{FakeDaytona, Reply, sandbox_json};
+
+        let deleted = AtomicBool::new(false);
+        let created = sandbox_json("creating");
+        let fake = FakeDaytona::start(|_| {
+            Arc::new(move |method, _| match method {
+                "POST" => Reply::Json(201, created.clone()),
+                "DELETE" => {
+                    deleted.store(true, Ordering::SeqCst);
+                    Reply::Json(200, created.clone())
+                }
+                "GET" if deleted.load(Ordering::SeqCst) => Reply::Json(404, "{}".to_owned()),
+                "GET" => Reply::Hang,
+                _ => panic!("unexpected method {method}"),
+            })
+        })
+        .await;
+        let provider = DaytonaProvider::from_client(fake.client().await, true);
+        let params = CreateParams::Snapshot(SnapshotParams {
+            base:     SandboxBaseParams::default(),
+            snapshot: "base".to_owned(),
+        });
+        let error = time::timeout(
+            Duration::from_secs(3),
+            provider.create_inner(params, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the create wait and cleanup are bounded")
+        .expect_err("observation times out");
+        assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
+        assert_eq!(fake.deletes(), 1);
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn connect_explicit_rejects_missing_credentials_without_consulting_the_environment() {

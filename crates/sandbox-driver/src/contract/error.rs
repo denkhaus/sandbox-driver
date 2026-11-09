@@ -114,4 +114,16 @@ impl Error {
             message: message.into(),
         }
     }
+
+    pub(crate) fn invalid_config(
+        entry: &ProviderName,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::InvalidConfig {
+            entry:   entry.clone(),
+            path:    path.into(),
+            message: message.into(),
+        }
+    }
 }
