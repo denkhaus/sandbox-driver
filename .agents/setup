@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: pinned mise, the locked Rust toolchains and cargo
+# tools from mise.toml, the pinned Rust style guide, and a warm build cache.
+# Runs again on stale snapshots, so every step must be idempotent and cheap
+# when its work is already done.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# Matches min_version in mise.toml and the version CI pins.
+mise_version="2026.6.11"
+mise_bin="$HOME/.local/bin/mise"
+
+step() {
+  local label=$1
+  shift
+  local started=$SECONDS
+  echo "==> $label"
+  "$@"
+  echo "<== $label ($((SECONDS - started))s)"
+}
+
+install_mise() {
+  if [[ -x "$mise_bin" && "$("$mise_bin" --version 2>/dev/null)" == "$mise_version "* ]]; then
+    echo "mise $mise_version already installed"
+    return
+  fi
+  curl -fsSL https://mise.run | MISE_VERSION="v$mise_version" MISE_QUIET=1 sh
+}
+
+persist_path() {
+  # ~/.bash_profile shadows ~/.profile, so login shells for Amp and orb
+  # services would otherwise miss ~/.local/bin and the mise shims.
+  local marker="# sandbox-driver: mise tools"
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >>"$HOME/.bash_profile" <<'EOF'
+
+# sandbox-driver: mise tools
+case ":$PATH:" in
+  *":$HOME/.local/share/mise/shims:"*) ;;
+  *) export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH" ;;
+esac
+EOF
+  fi
+}
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+step "Install mise $mise_version" install_mise
+step "Persist mise PATH" persist_path
+step "Trust mise.toml" mise trust --quiet "$repo_root/mise.toml"
+step "Install locked tools" mise install --locked --jobs=1
+step "Prepare Rust style guide" mise run setup
+
+# Warm the caches for the routine commands so later builds in the orb are
+# incremental. Each command resolves features differently, so warm each
+# one. A broken default branch should not keep the toolchains out of the
+# snapshot, so a failed warm-up only warns.
+warm() {
+  "$@" || echo "warning: '$*' failed; its build cache stays cold" >&2
+}
+step "Warm mise run dev" warm mise run dev
+step "Warm mise run test" warm cargo nextest run --locked --all-targets --all-features --no-run
+step "Warm mise run plugins:build" warm mise run plugins:build
+step "Warm mise run lint" warm mise run lint
