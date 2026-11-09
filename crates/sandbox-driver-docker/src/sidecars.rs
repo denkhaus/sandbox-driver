@@ -21,6 +21,7 @@
 //! and never waited on. A service that must be reachable needs a check.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use bollard::Docker;
@@ -28,14 +29,18 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogsOptions, NetworkingConfig,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::models::{ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig};
-use bollard::network::{CreateNetworkOptions, DisconnectNetworkOptions, InspectNetworkOptions};
+use bollard::models::{
+    ContainerStateStatusEnum, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
+};
+use bollard::network::{
+    CreateNetworkOptions, DisconnectNetworkOptions, InspectNetworkOptions, ListNetworksOptions,
+};
 use futures_util::StreamExt;
 use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
 use crate::config::{Sidecar, to_health_config};
-use crate::container::confirm_stopped;
+use crate::container::{confirm_stopped, remove_container_forced};
 use crate::daemon::{
     docker_error, docker_kind, is_not_found, is_not_modified, listed_id, tolerate_not_modified,
 };
@@ -44,9 +49,22 @@ use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
-/// How long to wait for every sidecar to report healthy, from when they
-/// have all been started.
-const HEALTH_WAIT: Duration = Duration::from_secs(300);
+/// The full ID of the sandbox a sidecar or its network belongs to, so they
+/// can be found and removed by that ID after the primary is gone.
+pub(crate) const OWNER_LABEL: &str = "sh.sandbox-driver.sandbox";
+/// A sidecar's readiness deadline in milliseconds, kept on the container so
+/// a restart rechecks readiness with the budget the sandbox was admitted
+/// with.
+const READY_DEADLINE_LABEL: &str = "sh.sandbox-driver.ready-deadline-ms";
+/// The service name a sidecar answers to on its network.
+const SERVICE_LABEL: &str = "sh.sandbox-driver.service";
+/// The comma-separated TCP ports a service declared reachable.
+const PORTS_LABEL: &str = "sh.sandbox-driver.service-ports";
+/// The readiness deadline of a sidecar that declares none, from when the
+/// sidecars have all been started. Creation's own budget is no longer.
+pub(crate) const HEALTH_WAIT: Duration = Duration::from_secs(300);
+/// The health check test that turns off an image's own `HEALTHCHECK`.
+pub(crate) const NO_HEALTHCHECK: &str = "NONE";
 /// How often to poll a sidecar's health.
 const HEALTH_POLL: Duration = Duration::from_millis(250);
 /// Log lines quoted in a health failure: enough to show why a service
@@ -55,6 +73,45 @@ const FAILURE_LOG_LINES: usize = 10;
 /// Bound on fetching that tail: the failure is what matters, and a slow
 /// daemon must not turn it into a hang.
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One sidecar as `create` starts it: the caller's options, the Docker
+/// health check that decides readiness, and how long readiness may take.
+pub(crate) struct Service {
+    pub(crate) sidecar:  Sidecar,
+    pub(crate) health:   Option<HealthConfig>,
+    pub(crate) deadline: Duration,
+    /// Ports the workload reaches the service on, as reported by status.
+    pub(crate) ports:    Vec<u16>,
+}
+
+// Written by hand: the sidecar's registry credential must never be printed.
+impl fmt::Debug for Service {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Service")
+            .field("name", &self.sidecar.name)
+            .field("image", &self.sidecar.image)
+            .field(
+                "registry_auth",
+                &self.sidecar.registry_auth.as_ref().map(|_| "<redacted>"),
+            )
+            .field("health", &self.health)
+            .field("deadline", &self.deadline)
+            .field("ports", &self.ports)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<Sidecar> for Service {
+    fn from(sidecar: Sidecar) -> Self {
+        Self {
+            health: sidecar.health.as_ref().map(to_health_config),
+            sidecar,
+            deadline: HEALTH_WAIT,
+            ports: Vec::new(),
+        }
+    }
+}
 
 /// The container name of `sidecar` on `network`.
 fn container_name(network: &str, sidecar: &Sidecar) -> String {
@@ -65,10 +122,16 @@ fn container_name(network: &str, sidecar: &Sidecar) -> String {
 /// with a health check to report healthy; the ones without are left to
 /// run or exit as they will. The creation owner tears down partial resources
 /// on failure within its cleanup budget.
-pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]) -> Result<()> {
+pub(crate) async fn realize(
+    docker: &Docker,
+    network: &str,
+    owner: &str,
+    services: &[Service],
+) -> Result<()> {
     let mut labels = HashMap::new();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
     labels.insert(NETWORK_LABEL.to_owned(), network.to_owned());
+    labels.insert(OWNER_LABEL.to_owned(), owner.to_owned());
     docker
         .create_network(CreateNetworkOptions {
             name: network.to_owned(),
@@ -80,17 +143,26 @@ pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]
 
     // The creation owner performs bounded cleanup while retaining the
     // primary container as the discovery anchor if cleanup is incomplete.
-    start_all(docker, network, sidecars, &labels).await
+    start_all(docker, network, services, &labels).await
 }
 
 async fn start_all(
     docker: &Docker,
     network: &str,
-    sidecars: &[Sidecar],
+    services: &[Service],
     labels: &HashMap<String, String>,
 ) -> Result<()> {
-    for sidecar in sidecars {
+    for service in services {
+        let sidecar = &service.sidecar;
         let container = container_name(network, sidecar);
+        let mut labels = labels.clone();
+        labels.insert(
+            READY_DEADLINE_LABEL.to_owned(),
+            service.deadline.as_millis().to_string(),
+        );
+        labels.insert(SERVICE_LABEL.to_owned(), sidecar.name.clone());
+        let ports: Vec<String> = service.ports.iter().map(u16::to_string).collect();
+        labels.insert(PORTS_LABEL.to_owned(), ports.join(","));
         let env: Vec<String> = sidecar
             .env
             .iter()
@@ -114,8 +186,8 @@ async fn start_all(
             env: non_empty(env),
             user: sidecar.user.clone(),
             entrypoint: sidecar.entrypoint.clone(),
-            labels: Some(labels.clone()),
-            healthcheck: sidecar.health.as_ref().map(to_health_config),
+            labels: Some(labels),
+            healthcheck: service.health.clone(),
             host_config: Some(host_config),
             networking_config: Some(NetworkingConfig {
                 endpoints_config: endpoints,
@@ -137,12 +209,21 @@ async fn start_all(
             .await
             .map_err(|error| docker_error("starting sidecar", error))?;
     }
-    // One deadline for all of them: they were started together, so the
-    // readiness budget bounds the whole wait, not each service's turn.
-    let deadline = Instant::now() + HEALTH_WAIT;
-    for sidecar in sidecars {
-        if sidecar.health.is_some() {
-            await_health(docker, &container_name(network, sidecar), deadline).await?;
+    // Deadlines count from when they were all started, so each budget
+    // bounds that service's whole wait, not just its turn.
+    let started = Instant::now();
+    for service in services {
+        let watched = service.health.as_ref().is_some_and(|health| {
+            health
+                .test
+                .as_deref()
+                .and_then(<[String]>::first)
+                .map(String::as_str)
+                != Some(NO_HEALTHCHECK)
+        });
+        if watched {
+            let container = container_name(network, &service.sidecar);
+            await_health(docker, &container, started + service.deadline).await?;
         }
     }
     Ok(())
@@ -151,8 +232,8 @@ async fn start_all(
 /// Pulls missing sidecar images. `create` calls this before claiming the
 /// sandbox, as it does for the primary image, so a slow pull never spends
 /// the bounded provisioning budget held under the claim.
-pub(crate) async fn prepare_images(docker: &Docker, sidecars: &[Sidecar]) -> Result<()> {
-    for sidecar in sidecars {
+pub(crate) async fn prepare_images(docker: &Docker, services: &[Service]) -> Result<()> {
+    for Service { sidecar, .. } in services {
         if !image_present(docker, &sidecar.image).await? {
             pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
         }
@@ -336,8 +417,14 @@ pub(crate) async fn set_running(
     }
     // Start every service before waiting: a health check may depend on
     // another service on the same network.
-    let deadline = Instant::now() + HEALTH_WAIT;
+    let started = Instant::now();
     for container in containers {
+        let deadline = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(READY_DEADLINE_LABEL))
+            .and_then(|millis| millis.parse().ok())
+            .map_or(HEALTH_WAIT, Duration::from_millis);
         let id = listed_id(container.id, "sidecar")?;
         let inspect = docker
             .inspect_container(&id, None)
@@ -349,8 +436,68 @@ pub(crate) async fn set_running(
             .and_then(|state| state.health.as_ref())
             .is_some()
         {
-            await_health(docker, &id, deadline).await?;
+            await_health(docker, &id, started + deadline).await?;
         }
     }
     Ok(())
+}
+
+/// Removes the sidecars and networks labelled as `owner`'s. Delete calls
+/// this when the primary is already gone, so services it left behind are
+/// not orphaned; sidecars go before their network.
+pub(crate) async fn sweep_owned(docker: &Docker, owner: &str) -> Result<()> {
+    let filter = HashMap::from([("label".to_owned(), vec![format!("{OWNER_LABEL}={owner}")])]);
+    let containers = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: filter.clone(),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|error| docker_error("listing orphaned sidecars", error))?;
+    for container in containers {
+        let id = listed_id(container.id, "sidecar")?;
+        remove_container_forced(docker, &id, "removing orphaned sidecar").await?;
+    }
+    let networks = docker
+        .list_networks(Some(ListNetworksOptions { filters: filter }))
+        .await
+        .map_err(|error| docker_error("listing orphaned sidecar networks", error))?;
+    for network in networks {
+        let id = listed_id(network.id, "network")?;
+        match docker.remove_network(&id).await {
+            Ok(()) => {}
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(docker_error("removing orphaned sidecar network", error)),
+        }
+    }
+    Ok(())
+}
+
+/// The services on `network` that are running now, by the name the workload
+/// reaches them at, with their declared ports. Stopped services are omitted:
+/// their address is not a current observation.
+pub(crate) async fn running(docker: &Docker, network: &str) -> Result<Vec<(String, Vec<u16>)>> {
+    let containers = docker
+        .list_containers(Some(network_filter(network)))
+        .await
+        .map_err(|error| docker_error("listing sidecars", error))?;
+    Ok(containers
+        .into_iter()
+        .filter(|container| container.state.as_deref() == Some("running"))
+        .filter_map(|container| {
+            let labels = container.labels?;
+            let name = labels.get(SERVICE_LABEL)?.clone();
+            let ports = labels
+                .get(PORTS_LABEL)
+                .map(|ports| {
+                    ports
+                        .split(',')
+                        .filter_map(|port| port.parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((name, ports))
+        })
+        .collect())
 }

@@ -18,13 +18,14 @@ use sandbox_driver::{
 use serde::Deserialize;
 use tokio::time;
 
-use crate::config::{DockerProviderConfig, RegistryAuth, Sidecar};
+use crate::config::{DockerProviderConfig, RegistryAuth};
 use crate::container::{inspect_container, remove_container_forced};
 use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quote};
 use crate::inspect::map_state;
+use crate::sidecars::Service;
 use crate::{
-    DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT,
-    SIDECAR_NETWORK_LABEL, fence, non_empty, sidecars,
+    CALLER_LABELS_LABEL, DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY,
+    RUNTIME_DIRECTORY_PARENT, SIDECAR_NETWORK_LABEL, fence, non_empty, sidecars,
 };
 
 /// Everything `create` decides before it touches the daemon, derived from
@@ -36,7 +37,7 @@ pub(crate) struct ContainerPlan {
     pub(crate) auto_pull:       bool,
     pub(crate) registry_auth:   Option<RegistryAuth>,
     pub(crate) platform:        Option<String>,
-    pub(crate) sidecars:        Vec<Sidecar>,
+    pub(crate) sidecars:        Vec<Service>,
     /// The user-defined network the sandbox and its sidecars share, when
     /// it has sidecars.
     pub(crate) sidecar_network: Option<String>,
@@ -48,9 +49,10 @@ pub(crate) struct ContainerPlan {
 }
 
 impl ContainerPlan {
-    /// Validates the spec and maps it onto a container. Deterministic:
-    /// no daemon is consulted.
-    pub(crate) fn plan(spec: &SandboxSpec) -> Result<Self> {
+    /// Validates the spec and maps it onto a container, with `services`
+    /// started beside it in addition to `provider_config.sidecars`.
+    /// Deterministic: no daemon is consulted.
+    pub(crate) fn plan(spec: &SandboxSpec, mut services: Vec<Service>) -> Result<Self> {
         spec.validate()?;
         validate_supported_creation_fields(spec)?;
         if matches!(spec.sandbox_kind, Some(kind) if kind != SandboxKind::Container) {
@@ -71,12 +73,13 @@ impl ContainerPlan {
                 "the docker provider does not support volumes yet",
             ));
         }
-        let config_options = provider_config(&spec.provider_config)?;
+        let mut config_options = provider_config(&spec.provider_config)?;
+        services.extend(config_options.sidecars.drain(..).map(Service::from));
         let base_network = if config_options.host_network {
             if !matches!(
                 spec.network,
                 NetworkPolicy::ProviderDefault | NetworkPolicy::AllowAll
-            ) || !config_options.sidecars.is_empty()
+            ) || !services.is_empty()
             {
                 return Err(Error::invalid_spec(
                     "provider_config.host_network",
@@ -89,7 +92,7 @@ impl ContainerPlan {
         };
         // Sidecars live on one user-defined network the main container
         // joins, named after the sandbox. They need a named sandbox.
-        let sidecar_network = if config_options.sidecars.is_empty() {
+        let sidecar_network = if services.is_empty() {
             None
         } else {
             let name = spec.name.clone().ok_or_else(|| {
@@ -107,6 +110,11 @@ impl ContainerPlan {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        let caller_keys: Vec<&String> = spec.labels.keys().collect();
+        labels.insert(
+            CALLER_LABELS_LABEL.to_owned(),
+            serde_json::to_string(&caller_keys).expect("label keys serialize"),
+        );
         labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
         if let Some(network) = &sidecar_network {
             labels.insert(SIDECAR_NETWORK_LABEL.to_owned(), network.clone());
@@ -122,7 +130,6 @@ impl ContainerPlan {
             dns,
             cap_add,
             registry_auth,
-            sidecars,
             ..
         } = config_options;
         // The labeled primary must exist before any dependent
@@ -214,7 +221,7 @@ impl ContainerPlan {
             auto_pull,
             registry_auth,
             platform,
-            sidecars,
+            sidecars: services,
             sidecar_network,
             config,
             options,
@@ -325,11 +332,11 @@ impl CreatedContainer {
     /// Brings up the sidecars and moves the container from its isolated
     /// initial network onto theirs. Nothing to do for a sandbox without
     /// sidecars.
-    pub(crate) async fn connect_sidecars(&self, sidecars: &[Sidecar]) -> Result<()> {
+    pub(crate) async fn connect_sidecars(&self, services: &[Service]) -> Result<()> {
         let Some(network) = &self.sidecar_network else {
             return Ok(());
         };
-        sidecars::realize(&self.docker, network, sidecars).await?;
+        sidecars::realize(&self.docker, network, &self.id, services).await?;
         self.docker
             .disconnect_network("none", DisconnectNetworkOptions {
                 container: self.id.as_str(),
@@ -466,7 +473,7 @@ mod tests {
         let spec = image_spec()
             .env_var("KEY", "value")
             .env_var(BASH_ENV_VAR, "/untrusted");
-        let plan = ContainerPlan::plan(&spec).expect("plan");
+        let plan = ContainerPlan::plan(&spec, Vec::new()).expect("plan");
         assert_eq!(plan.image, "debian:stable-slim");
         assert!(plan.sidecar_network.is_none());
         assert!(plan.options.is_none());
@@ -499,7 +506,7 @@ mod tests {
                 {"host": "/tmp/data", "container": "/data", "mode": "ro"}
             ]
         });
-        let plan = ContainerPlan::plan(&spec).expect("plan");
+        let plan = ContainerPlan::plan(&spec, Vec::new()).expect("plan");
         let host = host_config(&plan);
         assert_eq!(host.mounts, None, "the bound workspace needs no volume");
         assert_eq!(
@@ -515,7 +522,7 @@ mod tests {
     fn sidecars_keep_the_container_isolated_while_preparing_their_network() {
         let mut spec = image_spec().name("demo");
         spec.provider_config = json!({"sidecars": [{"name": "db", "image": "postgres:16"}]});
-        let plan = ContainerPlan::plan(&spec).expect("plan");
+        let plan = ContainerPlan::plan(&spec, Vec::new()).expect("plan");
         assert_eq!(plan.sidecar_network.as_deref(), Some("demo-net"));
         assert_eq!(plan.sidecars.len(), 1);
         assert_eq!(host_config(&plan).network_mode.as_deref(), Some("none"));
@@ -533,26 +540,28 @@ mod tests {
     fn sidecars_need_a_named_sandbox() {
         let mut spec = image_spec();
         spec.provider_config = json!({"sidecars": [{"name": "db", "image": "postgres:16"}]});
-        let error = ContainerPlan::plan(&spec).expect_err("unnamed");
+        let error = ContainerPlan::plan(&spec, Vec::new()).expect_err("unnamed");
         assert!(matches!(error, Error::InvalidSpec { field, .. } if field == "name"));
     }
 
     #[test]
     fn network_policies_map_onto_network_modes() {
-        let plan = ContainerPlan::plan(&image_spec().network(NetworkPolicy::Block)).expect("plan");
+        let plan = ContainerPlan::plan(&image_spec().network(NetworkPolicy::Block), Vec::new())
+            .expect("plan");
         assert_eq!(host_config(&plan).network_mode.as_deref(), Some("none"));
-        let plan =
-            ContainerPlan::plan(&image_spec().network(NetworkPolicy::AllowAll)).expect("plan");
+        let plan = ContainerPlan::plan(&image_spec().network(NetworkPolicy::AllowAll), Vec::new())
+            .expect("plan");
         assert_eq!(host_config(&plan).network_mode.as_deref(), Some("bridge"));
 
         let mut spec = image_spec();
         spec.provider_config = json!({"host_network": true});
-        let plan = ContainerPlan::plan(&spec).expect("plan");
+        let plan = ContainerPlan::plan(&spec, Vec::new()).expect("plan");
         assert_eq!(host_config(&plan).network_mode.as_deref(), Some("host"));
 
         let mut spec = image_spec().network(NetworkPolicy::Block);
         spec.provider_config = json!({"host_network": true});
-        let error = ContainerPlan::plan(&spec).expect_err("host networking is unrestricted");
+        let error =
+            ContainerPlan::plan(&spec, Vec::new()).expect_err("host networking is unrestricted");
         assert!(matches!(
             error,
             Error::InvalidSpec { field, .. } if field == "provider_config.host_network"
@@ -565,7 +574,7 @@ mod tests {
         spec.resources.cpu_cores = Some(2);
         spec.resources.memory_mb = Some(512);
         spec.provider_config = json!({"platform": "linux/amd64", "init": true});
-        let plan = ContainerPlan::plan(&spec).expect("plan");
+        let plan = ContainerPlan::plan(&spec, Vec::new()).expect("plan");
         let host = host_config(&plan);
         assert_eq!(host.memory, Some(512 * 1024 * 1024));
         assert_eq!(host.cpu_quota, Some(200_000));

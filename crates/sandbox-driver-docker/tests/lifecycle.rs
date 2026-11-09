@@ -655,6 +655,10 @@ async fn failed_delete_release_remains_busy_by_name_and_short_id() {
             }
             return (200, json!([]));
         }
+        // Reconciling the absent sandbox's sidecar networks finds none.
+        if request.starts_with("GET ") && request.contains("/networks?") {
+            return (200, json!([]));
+        }
         panic!("unexpected request: {request}");
     })
     .await;

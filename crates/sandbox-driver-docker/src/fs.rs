@@ -154,7 +154,7 @@ impl DockerFs {
         scanner.finish()
     }
 
-    async fn read_range_to(
+    pub(crate) async fn read_range_to(
         &self,
         path: &str,
         offset: u64,

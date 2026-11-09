@@ -19,7 +19,7 @@ use bollard::errors::Error as DockerApiError;
 use bollard::models::{ContainerCreateResponse, ContainerInspectResponse};
 use futures_util::future::BoxFuture;
 use sandbox_driver::contract::RemainingResource;
-use sandbox_driver::{Error, ProviderError, Result, Sandbox, TransportError};
+use sandbox_driver::{Error, ProviderError, Result, TransportError};
 use serde_json::Value;
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, timeout};
@@ -29,12 +29,13 @@ use crate::container::{inspect_container, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict};
 use crate::inspect::label_of;
 use crate::one_shot::ONE_SHOT_LABEL;
+use crate::sandbox::DockerSandbox;
 use crate::sidecars::NETWORK_LABEL;
 
 mod failure;
 
 use failure::{Disposition, diagnostic};
-pub(crate) use failure::{Failure, WorkResult, combine};
+pub(crate) use failure::{Failure, WorkResult, combine, outcome_unknown};
 
 pub(crate) const FENCE_NAME_LABEL: &str = "sh.sandbox-driver.fence-name";
 pub(crate) const FENCE_LABEL: &str = "sh.sandbox-driver.fence";
@@ -254,6 +255,24 @@ async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Opti
     }
 }
 
+/// Whether a stop or delete holds the claim of the inspected primary now.
+/// Work admitted earlier that ends while one is held was ended by it.
+pub(crate) async fn draining(docker: &Docker, primary: &ContainerInspectResponse) -> Result<bool> {
+    let Some(id) = primary.id.as_deref() else {
+        return Ok(false);
+    };
+    let name = label_of(primary, FENCE_NAME_LABEL)
+        .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned);
+    match discover(docker, id, &name).await {
+        Ok(marker) => Ok(matches!(
+            label_of(&marker, OPERATION_LABEL),
+            Some(label) if label == Operation::Stop.label() || label == Operation::Delete.label()
+        )),
+        Err(Error::NotFound { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Allocates the gate before the primary is visible to attach/list. Its name
 /// is stored in the primary's immutable labels, so all later clients use it.
 pub(crate) fn reserve_creation(labels: &mut Option<HashMap<String, String>>) -> String {
@@ -281,8 +300,8 @@ pub(crate) fn create<'a>(
     image: &'a str,
     name: &'a str,
     sandbox: &'a str,
-    work: impl Future<Output = WorkResult<Arc<dyn Sandbox>>> + Send + 'a,
-) -> BoxFuture<'a, Result<Arc<dyn Sandbox>>> {
+    work: impl Future<Output = WorkResult<Arc<DockerSandbox>>> + Send + 'a,
+) -> BoxFuture<'a, Result<Arc<DockerSandbox>>> {
     // Boxed for the same reason as `run`.
     Box::pin(async move {
         let attempt = create_marker(docker, image, name, sandbox, sandbox, Operation::Create).await;
@@ -293,7 +312,7 @@ pub(crate) fn create<'a>(
             sandbox,
             Operation::Create,
             work,
-            |sandbox| Some(sandbox.id().as_str().to_owned()),
+            |sandbox| Some(sandbox.id.as_str().to_owned()),
         )
         .await
     })

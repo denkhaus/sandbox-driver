@@ -1,7 +1,7 @@
 //! Readback helpers: what a container inspect says about the sandbox it
 //! backs, and the status built from it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bollard::models::{
     ContainerInspectResponse, ContainerStateStatusEnum, Mount, MountPointTypeEnum, MountTypeEnum,
@@ -11,7 +11,10 @@ use sandbox_driver::{
 };
 
 use crate::one_shot::ONE_SHOT_LABEL;
-use crate::{DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, SIDECAR_NETWORK_LABEL, fence};
+use crate::sidecars::NETWORK_LABEL;
+use crate::{
+    CALLER_LABELS_LABEL, DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, SIDECAR_NETWORK_LABEL, fence,
+};
 
 /// What a sandbox handle needs to know about its container, read from
 /// one inspect. `create` and `attach` build handles from the same facts,
@@ -39,13 +42,7 @@ impl ContainerFacts {
             .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
         let labels = config
             .and_then(|config| config.labels.as_ref())
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter(|(key, _)| !is_internal_label(key))
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
+            .map(caller_labels)
             .unwrap_or_default();
         Self {
             id: inspect.id.clone().unwrap_or_else(|| fallback_id.to_owned()),
@@ -115,11 +112,7 @@ pub(crate) fn status_from_inspect(
         .unwrap_or_default();
     if let Some(config) = &inspect.config {
         if let Some(labels) = &config.labels {
-            status.labels = labels
-                .iter()
-                .filter(|(key, _)| !is_internal_label(key))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            status.labels = caller_labels(labels);
         }
         status.image.clone_from(&config.image);
     }
@@ -148,6 +141,16 @@ fn network_of(inspect: &ContainerInspectResponse) -> Option<NetworkPolicy> {
 /// else is not a sandbox, whatever else it is.
 pub(crate) fn is_managed(inspect: &ContainerInspectResponse) -> bool {
     label_of(inspect, MANAGED_LABEL) == Some("true")
+}
+
+/// Whether a managed container's labels mark a sandbox's primary container,
+/// rather than one of its sidecars or one-shots, which carry the managed
+/// label too so that cleanup finds them.
+pub(crate) fn is_primary(labels: &HashMap<String, String>) -> bool {
+    let set = |key: &str| labels.get(key).is_some_and(|value| !value.is_empty());
+    labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
+        && !set(ONE_SHOT_LABEL)
+        && !set(NETWORK_LABEL)
 }
 
 /// One label of an inspected container.
@@ -199,9 +202,30 @@ pub(crate) fn workspace_of(inspect: &ContainerInspectResponse, working_dir: &str
     })
 }
 
+/// The caller's labels on a container: the keys recorded at create, or,
+/// for a container created before keys were recorded, every label the
+/// provider did not write for itself.
+pub(crate) fn caller_labels(labels: &HashMap<String, String>) -> BTreeMap<String, String> {
+    let recorded = labels
+        .get(CALLER_LABELS_LABEL)
+        .and_then(|keys| serde_json::from_str::<Vec<String>>(keys).ok());
+    match recorded {
+        Some(keys) => keys
+            .into_iter()
+            .filter_map(|key| labels.get(&key).map(|value| (key, value.clone())))
+            .collect(),
+        None => labels
+            .iter()
+            .filter(|(key, _)| !is_internal_label(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    }
+}
+
 /// Labels the provider writes for itself, never reported as the caller's.
 pub(crate) fn is_internal_label(key: &str) -> bool {
     key == MANAGED_LABEL
+        || key == CALLER_LABELS_LABEL
         || key == ONE_SHOT_LABEL
         || key == SIDECAR_NETWORK_LABEL
         || key == fence::FENCE_NAME_LABEL
@@ -227,6 +251,34 @@ mod tests {
     use bollard::models::{ContainerConfig, MountPoint};
 
     use super::*;
+
+    #[test]
+    fn only_the_recorded_keys_are_the_callers_labels() {
+        let labels = HashMap::from([
+            (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            (CALLER_LABELS_LABEL.to_owned(), r#"["team"]"#.to_owned()),
+            ("team".to_owned(), "petri".to_owned()),
+            (
+                "org.opencontainers.image.title".to_owned(),
+                "base".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            caller_labels(&labels),
+            BTreeMap::from([("team".to_owned(), "petri".to_owned())])
+        );
+        // A container from before keys were recorded keeps every label the
+        // provider did not write.
+        let older = HashMap::from([
+            (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            ("team".to_owned(), "petri".to_owned()),
+            (
+                "org.opencontainers.image.title".to_owned(),
+                "base".to_owned(),
+            ),
+        ]);
+        assert_eq!(caller_labels(&older).len(), 2);
+    }
 
     #[test]
     fn container_facts_come_from_the_inspect_alone() {

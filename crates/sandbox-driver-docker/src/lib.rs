@@ -67,6 +67,7 @@ mod one_shot;
 mod output;
 mod provider;
 mod pty;
+mod runtime;
 mod sandbox;
 mod sidecars;
 
@@ -76,10 +77,15 @@ pub use crate::config::{BindMount, DockerProviderConfig, Health, RegistryAuth, S
 pub use crate::exec::DockerExec;
 pub use crate::one_shot::is_missing_platform;
 pub use crate::provider::DockerProvider;
+pub use crate::runtime::DockerFactory;
 pub use crate::sandbox::DockerSandbox;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 pub(crate) const SIDECAR_NETWORK_LABEL: &str = "sh.sandbox-driver.sidecar-network";
+/// The keys of the caller's labels, as a JSON list. Docker merges the
+/// image's own labels into the container's, so only these keys are
+/// reported back as the caller's.
+pub(crate) const CALLER_LABELS_LABEL: &str = "sh.sandbox-driver.labels";
 pub(crate) const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 pub(crate) const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";

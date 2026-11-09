@@ -149,7 +149,62 @@ target/debug/lithos-sandbox --provider docker sandbox start "$id" --wait
 target/debug/lithos-sandbox --provider docker sandbox delete "$id"
 ```
 
-Portable workload translation, namespace and descriptor reporting, next-API
-provider integration, and the new cross-provider conformance harness are separate
-migration work. Passing the legacy suite or these focused tests is not evidence
-that Docker passes that full contract.
+## Shared contract runtime
+
+`sandbox_driver_docker::DockerFactory` registers Docker as a built-in with a
+`contract::Registry`. An entry's only `config` key is `host` (`unix://`,
+`tcp://` or `http://`; default `unix:///var/run/docker.sock`); nothing is read
+from the ambient environment. The runtime drives the same container plan,
+claims and stop fence described above, so legacy and new-contract clients
+coordinate on one daemon.
+
+The descriptor reports the namespace `docker:<engine ID>` (stable across daemon
+restarts, different per daemon), `durability: machine`, `access: shared`, image
+sources, cpu and memory, the `allow_all` and `block` network modes, every
+`container` field, services, one-shot containers, pause and resume, and the
+shell-command endpoint. No timers are enforced, so any timer request is
+`unsupported`, as are disk, GPUs, other sources and allow-list networks.
+
+- **Services** become sidecars on the workload's network, reachable by their
+  service name. A readiness check runs as an exec-form Docker health check in
+  the service, with its own deadline (at most five minutes), on create and
+  again on start. Docker runs the first check one interval after the service
+  starts, so `interval_ms` must be shorter than `deadline_ms`. A service
+  without a check is only confirmed started, and its image's own
+  `HEALTHCHECK` is turned off. `status.services` lists only services running
+  now. A service
+  `credential` names a secret whose value is a JSON object with `username`,
+  `password` and an optional `server`.
+- **`provider_config`** takes `auto_pull`, `platform`, `binds` and
+  `host_network`, described by the descriptor's `spec_schema`. `binds` is
+  refused unless the daemon is local (`unix://`), matching the descriptor's
+  `mounts_host_paths`.
+- **Labels** under `sh.sandbox-driver.` are reserved. Docker merges an image's
+  own labels into the container's, so the caller's keys are recorded in
+  `sh.sandbox-driver.labels` and only those are reported by `status` and
+  `list` or matched by a label filter. Sandboxes created before that label
+  existed report every label the provider did not write.
+- **Exec** runs argv without a shell; `tty` is unsupported. A command on a
+  sandbox that is not running is refused, never reported as an outcome. A
+  command that loses its stream reports `killed` only once its container run
+  is confirmed ended: at once if the run changed, or after waiting up to ten
+  seconds while a stop or delete holds the claim; otherwise the transport
+  error is returned. `files.list` uses POSIX `sh` and `find`, so it needs no
+  `bash`; a directory that exists but cannot be read fails the listing
+  instead of reporting `not_found`.
+- **Errors:** a daemon 404 maps to `not_found` only when the primary is gone;
+  a missing image or service is `unhealthy`, so callers do not treat the
+  sandbox as removed.
+- **Reconciliation:** sidecars and their network carry
+  `sh.sandbox-driver.sandbox=<full sandbox ID>`. Destroying a sandbox whose
+  primary is already gone removes them by that label before reporting success.
+  Neither inventory reports sidecars or one-shots as sandboxes.
+
+`cargo test -p sandbox-driver-docker --test contract -- --ignored` runs the
+shared conformance suite (with a second activated catalog for the
+cross-instance fence), the services and one-shot workload, label round-trip
+and exec on a stopped sandbox, refusal before admission, and reconciliation
+of a vanished primary against a live daemon.
+Ports are exposed as unsigned local forwards without a TTL; signed or expiring
+exposure is `unsupported`. Plugin-protocol transport for this runtime is the
+plugin lane's work.

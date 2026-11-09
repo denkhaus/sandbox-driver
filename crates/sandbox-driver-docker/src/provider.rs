@@ -26,7 +26,9 @@ use crate::fence::Operation;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
-use crate::inspect::{ContainerFacts, is_managed, sidecar_network_of, status_from_inspect};
+use crate::inspect::{
+    ContainerFacts, is_managed, is_primary, sidecar_network_of, status_from_inspect,
+};
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
@@ -113,6 +115,99 @@ impl DockerProvider {
         inspect_container(&self.docker, container_id).await
     }
 
+    /// Creates the planned sandbox under its creation claim. `name` is the
+    /// caller's requested name, which a delete of that name sees before the
+    /// primary exists.
+    pub(crate) async fn create_handle(
+        &self,
+        mut plan: Box<ContainerPlan>,
+        name: Option<String>,
+        events: Option<EventContext>,
+    ) -> Result<Arc<DockerSandbox>> {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::pending_sandbox(name.clone()),
+                Action::Create,
+                |reporter| async move {
+                    self.ensure_image(
+                        &plan.image,
+                        plan.auto_pull,
+                        plan.registry_auth.as_ref(),
+                        plan.platform.as_deref(),
+                        &reporter,
+                    )
+                    .await?;
+                    sidecars::prepare_images(&self.docker, &plan.sidecars).await?;
+                    let fence_name = fence::reserve_creation(&mut plan.config.labels);
+                    let owner = name.as_deref().unwrap_or(&fence_name);
+                    fence::create(&self.docker, &plan.image, &fence_name, owner, async {
+                        let created = CreatedContainer::create(&self.docker, &plan).await?;
+                        let provisioning = async {
+                            let event_id =
+                                SandboxId::try_new(created.id.clone()).map_err(|error| {
+                                    Error::invalid_spec("sandbox_id", error.to_string())
+                                })?;
+                            reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                            created.connect_sidecars(&plan.sidecars).await?;
+                            created.start().await?;
+                            created.verify_running(&self.kind).await
+                        };
+                        // A timeout here still removes what creation made; one
+                        // left to the claim's bound would drop that cleanup.
+                        let started =
+                            match time::timeout(fence::PROVISIONING_WORK, provisioning).await {
+                                Ok(Ok(started)) => started,
+                                Ok(Err(error)) => return Err(created.abandon(error).await),
+                                Err(_) => {
+                                    let error = Error::Transport(TransportError::new(
+                                        "sandbox provisioning exceeded its time budget",
+                                    ));
+                                    return Err(created.abandon(error).await);
+                                }
+                            };
+                        let facts = ContainerFacts::from_inspect(&started, &created.id);
+                        Ok(self.handle(facts, handle_emitter))
+                    })
+                    .await
+                },
+            )
+            .await
+    }
+
+    /// Attaches to a managed sandbox by container ID or name.
+    pub(crate) async fn attach_handle(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<DockerSandbox>> {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Attach,
+                |_| async move {
+                    let inspect = self.inspect(id.as_str()).await?;
+                    let primary = inspect
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.labels.as_ref())
+                        .is_some_and(is_primary);
+                    if !primary {
+                        return Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       id.as_str().to_owned(),
+                        });
+                    }
+                    let facts = ContainerFacts::from_inspect(&inspect, id.as_str());
+                    Ok(self.handle(facts, handle_emitter))
+                },
+            )
+            .await
+    }
+
     /// Builds a handle from Docker state alone: no exec runs here, so
     /// `attach` works on a stopped container too.
     fn handle(&self, facts: ContainerFacts, events: EventEmitter) -> Arc<DockerSandbox> {
@@ -170,57 +265,9 @@ impl SandboxProvider for DockerProvider {
     ) -> Result<Arc<dyn Sandbox>> {
         // Boxed: the plan carries the whole container request, and a future
         // that held it inline would be large.
-        let mut plan = Box::new(ContainerPlan::plan(spec)?);
-        let emitter = EventEmitter::new(self.kind.clone(), events);
-        let handle_emitter = emitter.clone();
-        emitter
-            .run(
-                EventSubject::pending_sandbox(spec.name.clone()),
-                Action::Create,
-                |reporter| async move {
-                    self.ensure_image(
-                        &plan.image,
-                        plan.auto_pull,
-                        plan.registry_auth.as_ref(),
-                        plan.platform.as_deref(),
-                        &reporter,
-                    )
-                    .await?;
-                    sidecars::prepare_images(&self.docker, &plan.sidecars).await?;
-                    let fence_name = fence::reserve_creation(&mut plan.config.labels);
-                    let owner = spec.name.as_deref().unwrap_or(&fence_name);
-                    fence::create(&self.docker, &plan.image, &fence_name, owner, async {
-                        let created = CreatedContainer::create(&self.docker, &plan).await?;
-                        let provisioning = async {
-                            let event_id =
-                                SandboxId::try_new(created.id.clone()).map_err(|error| {
-                                    Error::invalid_spec("sandbox_id", error.to_string())
-                                })?;
-                            reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                            created.connect_sidecars(&plan.sidecars).await?;
-                            created.start().await?;
-                            created.verify_running(&self.kind).await
-                        };
-                        // A timeout here still removes what creation made; one
-                        // left to the claim's bound would drop that cleanup.
-                        let started =
-                            match time::timeout(fence::PROVISIONING_WORK, provisioning).await {
-                                Ok(Ok(started)) => started,
-                                Ok(Err(error)) => return Err(created.abandon(error).await),
-                                Err(_) => {
-                                    let error = Error::Transport(TransportError::new(
-                                        "sandbox provisioning exceeded its time budget",
-                                    ));
-                                    return Err(created.abandon(error).await);
-                                }
-                            };
-                        let facts = ContainerFacts::from_inspect(&started, &created.id);
-                        Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
-                    })
-                    .await
-                },
-            )
-            .await
+        let plan = Box::new(ContainerPlan::plan(spec, Vec::new())?);
+        let sandbox = self.create_handle(plan, spec.name.clone(), events).await?;
+        Ok(sandbox as Arc<dyn Sandbox>)
     }
 
     #[tracing::instrument(
@@ -233,25 +280,7 @@ impl SandboxProvider for DockerProvider {
         id: &SandboxId,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let emitter = EventEmitter::new(self.kind.clone(), events);
-        let handle_emitter = emitter.clone();
-        emitter
-            .run(
-                EventSubject::sandbox(Some(id.clone())),
-                Action::Attach,
-                |_| async move {
-                    let inspect = self.inspect(id.as_str()).await?;
-                    if !is_managed(&inspect) {
-                        return Err(Error::NotFound {
-                            resource: ResourceKind::Sandbox,
-                            id:       id.as_str().to_owned(),
-                        });
-                    }
-                    let facts = ContainerFacts::from_inspect(&inspect, id.as_str());
-                    Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
-                },
-            )
-            .await
+        Ok(self.attach_handle(id, events).await? as Arc<dyn Sandbox>)
     }
 
     #[tracing::instrument(
@@ -272,8 +301,12 @@ impl SandboxProvider for DockerProvider {
                     let inspect = match self.inspect(id.as_str()).await {
                         Ok(inspect) => inspect,
                         Err(Error::NotFound { .. }) => {
-                            let sweep =
-                                async { Ok(one_shot::sweep(&self.docker, id.as_str()).await?) };
+                            // The primary is gone; remove what it left behind
+                            // under its ID.
+                            let sweep = async {
+                                one_shot::sweep(&self.docker, id.as_str()).await?;
+                                Ok(sidecars::sweep_owned(&self.docker, id.as_str()).await?)
+                            };
                             return fence::run(&self.docker, id.as_str(), Operation::Delete, sweep)
                                 .await;
                         }
@@ -342,6 +375,16 @@ impl SandboxProvider for DockerProvider {
                 Err(Error::NotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
+            // Sidecars and one-shots carry the managed label for cleanup;
+            // they are not sandboxes.
+            let primary = inspect
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .is_some_and(is_primary);
+            if !primary {
+                continue;
+            }
             let sandbox_id = SandboxId::try_new(id)
                 .map_err(|error| Error::invalid_spec("id", error.to_string()))?;
             statuses.push(status_from_inspect(sandbox_id, &inspect));

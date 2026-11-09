@@ -126,7 +126,7 @@ pub(crate) fn combine(first: WorkResult<()>, second: WorkResult<()>) -> WorkResu
 
 /// Classify an infrastructure error on entry to the fenced operation. An HTTP
 /// response from a gateway is not proof of the upstream mutation's outcome.
-fn outcome_unknown(error: &Error) -> bool {
+pub(crate) fn outcome_unknown(error: &Error) -> bool {
     let mut cause: Option<&(dyn StdError + 'static)> = Some(error);
     while let Some(current) = cause {
         if matches!(current.downcast_ref::<Error>(), Some(Error::Transport(_)))
