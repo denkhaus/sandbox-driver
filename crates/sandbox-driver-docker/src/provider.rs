@@ -12,8 +12,9 @@ use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, HealthStatus,
     OperationReporter, Progress, ProgressCode, ProviderError, ProviderHealth, ProviderKind,
     ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxStatus,
+    SandboxStatus, TransportError,
 };
+use tokio::time;
 
 use crate::access::DockerShellCommand;
 use crate::config::RegistryAuth;
@@ -29,7 +30,7 @@ use crate::inspect::{ContainerFacts, is_managed, sidecar_network_of, status_from
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
-use crate::{MANAGED_LABEL, docker_capabilities, fence};
+use crate::{MANAGED_LABEL, docker_capabilities, fence, sidecars};
 
 /// The Docker provider, sharing one configured daemon connection.
 pub struct DockerProvider {
@@ -185,28 +186,34 @@ impl SandboxProvider for DockerProvider {
                         &reporter,
                     )
                     .await?;
+                    sidecars::prepare_images(&self.docker, &plan.sidecars).await?;
                     let fence_name = fence::reserve_creation(&mut plan.config.labels);
                     let owner = spec.name.as_deref().unwrap_or(&fence_name);
                     fence::create(&self.docker, &plan.image, &fence_name, owner, async {
                         let created = CreatedContainer::create(&self.docker, &plan).await?;
-                        let event_id = match SandboxId::try_new(created.id.clone()) {
-                            Ok(id) => id,
-                            Err(error) => {
-                                let error = Error::invalid_spec("sandbox_id", error.to_string());
-                                return Err(created.abandon(error).await);
-                            }
+                        let provisioning = async {
+                            let event_id =
+                                SandboxId::try_new(created.id.clone()).map_err(|error| {
+                                    Error::invalid_spec("sandbox_id", error.to_string())
+                                })?;
+                            reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                            created.connect_sidecars(&plan.sidecars).await?;
+                            created.start().await?;
+                            created.verify_running(&self.kind).await
                         };
-                        reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                        if let Err(error) = created.connect_sidecars(&plan.sidecars).await {
-                            return Err(created.abandon(error).await);
-                        }
-                        if let Err(error) = created.start().await {
-                            return Err(created.abandon(error).await);
-                        }
-                        let started = match created.verify_running(&self.kind).await {
-                            Ok(started) => started,
-                            Err(error) => return Err(created.abandon(error).await),
-                        };
+                        // A timeout here still removes what creation made; one
+                        // left to the claim's bound would drop that cleanup.
+                        let started =
+                            match time::timeout(fence::PROVISIONING_WORK, provisioning).await {
+                                Ok(Ok(started)) => started,
+                                Ok(Err(error)) => return Err(created.abandon(error).await),
+                                Err(_) => {
+                                    let error = Error::Transport(TransportError::new(
+                                        "sandbox provisioning exceeded its time budget",
+                                    ));
+                                    return Err(created.abandon(error).await);
+                                }
+                            };
                         let facts = ContainerFacts::from_inspect(&started, &created.id);
                         Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
                     })

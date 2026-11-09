@@ -911,6 +911,9 @@ async fn verify_stop_status_retention(status: u16, should_retain: bool) {
                 json!({"message": "upstream stop did not provide a timely response"}),
             );
         }
+        if request.contains("/containers/service/json") {
+            return (200, inspect(false));
+        }
         cleanup_reply(request)
     })
     .await;
@@ -927,6 +930,12 @@ async fn verify_stop_status_retention(status: u16, should_retain: bool) {
     assert_eq!(
         !released, should_retain,
         "HTTP {status}; error: {error}; trace: {trace:#?}"
+    );
+    assert!(
+        trace
+            .iter()
+            .any(|request| request.contains("/containers/service/stop")),
+        "HTTP {status}: a failed primary stop left services running; trace: {trace:#?}"
     );
 }
 

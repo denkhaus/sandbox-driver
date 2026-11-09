@@ -34,8 +34,9 @@ and stopping its services. It inspects the primary and services to confirm they
 are no longer running; missing or still-running state returns `fence_leaked`
 and retains the claim. Start, exec, one-shot admission, pause, resume, and
 delete cannot overtake that drain. A competing lifecycle claim is refused as a
-legacy `ProviderError` with code `busy`. Short concurrent execution admissions
-can wait up to five seconds for one another. Describe and inventory remain
+legacy `ProviderError` with code `busy`. Any operation waits up to five
+seconds behind a held admission claim, since admissions release quickly; a held
+lifecycle claim refuses it at once. Describe and inventory remain
 available while a claim is held, and so do the stop-request and PTY cleanup
 execs that end already-admitted commands: they start no new work, so a held
 claim must not keep a command from being stopped.
@@ -78,16 +79,24 @@ cleanup request whose outcome is unknown.
 The claim must not be removed merely because its creator disconnected or a
 period of time passed. An operator or application recovery procedure must first
 establish that the original request can no longer change the sandbox and that
-any required termination or cleanup is complete. Different clients, including
+any required termination or cleanup is complete. Then it removes the claim named
+in the error's `fence_container` with `docker rm <fence_container>`. Claims are
+unstarted containers, so `docker container prune` and `docker system prune`
+remove held and retained claims without any check; do not prune a daemon that
+has managed sandboxes in use. Different clients, including
 older provider versions and direct Docker commands, must not bypass this
 coordination while managed work is active. The mechanism coordinates cooperating
 provider clients; it is not an authorization boundary against Docker admins.
 
 Each daemon call that acquires, discovers, or releases a claim has a 60-second
 bound. Execution admission, stop, pause, resume, and delete have a 60-second
-operation bound; create and start have a six-minute bound to allow the existing
-service readiness budget. A failure to confirm claim release is an error even if
-the workload mutation completed.
+operation bound; create and start have a six-minute bound to allow the service
+readiness budget. Create pulls the primary and service images before it takes
+the claim. Under the claim, the work after the primary exists is bounded to five
+minutes, and a timeout runs the same failed-create cleanup as any other creation
+failure. Services are started together and share one five-minute readiness
+deadline, on create and on start. A failure to confirm claim release is an error
+even if the workload mutation completed.
 
 A failed create attempts dependent cleanup before removing the primary, with a
 30-second cleanup budget. Unconfirmed cleanup uses `incomplete_cleanup` and

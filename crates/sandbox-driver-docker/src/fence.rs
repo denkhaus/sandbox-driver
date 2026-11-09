@@ -43,8 +43,13 @@ const SANDBOX_NAME_LABEL: &str = "sh.sandbox-driver.fence-sandbox-name";
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_ADMISSION_POLL: Duration = Duration::from_millis(200);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
-/// Creation and start wait on image pulls and service readiness.
+/// Creation and start wait on service readiness. Images are pulled before
+/// the claim is taken.
 const PROVISIONING_TIMEOUT: Duration = Duration::from_secs(360);
+/// Creation work after the primary exists. It is bounded inside the claim so
+/// that a timeout still runs failed-create cleanup; the claim's own bound
+/// leaves room for creating the primary and for that cleanup.
+pub(crate) const PROVISIONING_WORK: Duration = Duration::from_secs(300);
 
 /// What a fence owner is doing, recorded on its marker.
 #[derive(Clone, Copy, PartialEq, Eq)]

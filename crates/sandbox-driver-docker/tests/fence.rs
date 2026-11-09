@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, TopOptions,
 };
 use sandbox_driver::{
     Error, ExecControls, ExecSpec, OneShotSpec, SandboxProvider, SandboxSource, SandboxSpec,
@@ -52,6 +52,29 @@ async fn wait_for_label(docker: &Docker, label: &str, id: &str) {
     })
     .await
     .expect("operation reached admission");
+}
+
+/// Waits until `command` runs in the sandbox and its admission claim is gone.
+/// `docker top` reads processes without an exec, so it needs no admission.
+async fn wait_for_admission(docker: &Docker, id: &str, claim: &str, command: &str) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let running = docker
+                .top_processes(id, None::<TopOptions<String>>)
+                .await
+                .expect("list sandbox processes")
+                .processes
+                .unwrap_or_default()
+                .iter()
+                .any(|process| process.iter().any(|field| field.contains(command)));
+            if running && docker.inspect_container(claim, None).await.is_err() {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command admitted");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -311,7 +334,6 @@ async fn a_held_lifecycle_claim_does_not_keep_a_timeout_from_stopping_a_command(
     });
     // Once the command is admitted, stand in for another client's lifecycle
     // claim, using the marker name recorded on the primary.
-    sleep(Duration::from_secs(1)).await;
     let id = sandbox.id().as_str();
     let inspect = docker
         .inspect_container(id, None)
@@ -322,6 +344,7 @@ async fn a_held_lifecycle_claim_does_not_keep_a_timeout_from_stopping_a_command(
         .and_then(|config| config.labels)
         .and_then(|labels| labels.get("sh.sandbox-driver.fence-name").cloned())
         .expect("primary records its fence name");
+    wait_for_admission(&docker, id, &name, "sleep 600").await;
     let marker = docker
         .create_container(
             Some(CreateContainerOptions {

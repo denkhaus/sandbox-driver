@@ -44,7 +44,8 @@ use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
-/// How long to wait for every sidecar to report healthy.
+/// How long to wait for every sidecar to report healthy, from when they
+/// have all been started.
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
 /// How often to poll a sidecar's health.
 const HEALTH_POLL: Duration = Duration::from_millis(250);
@@ -89,9 +90,6 @@ async fn start_all(
     labels: &HashMap<String, String>,
 ) -> Result<()> {
     for sidecar in sidecars {
-        if !image_present(docker, &sidecar.image).await? {
-            pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
-        }
         let container = container_name(network, sidecar);
         let env: Vec<String> = sidecar
             .env
@@ -139,16 +137,30 @@ async fn start_all(
             .await
             .map_err(|error| docker_error("starting sidecar", error))?;
     }
+    // One deadline for all of them: they were started together, so the
+    // readiness budget bounds the whole wait, not each service's turn.
+    let deadline = Instant::now() + HEALTH_WAIT;
     for sidecar in sidecars {
         if sidecar.health.is_some() {
-            await_health(docker, &container_name(network, sidecar)).await?;
+            await_health(docker, &container_name(network, sidecar), deadline).await?;
         }
     }
     Ok(())
 }
 
-async fn await_health(docker: &Docker, container: &str) -> Result<()> {
-    let deadline = Instant::now() + HEALTH_WAIT;
+/// Pulls missing sidecar images. `create` calls this before claiming the
+/// sandbox, as it does for the primary image, so a slow pull never spends
+/// the bounded provisioning budget held under the claim.
+pub(crate) async fn prepare_images(docker: &Docker, sidecars: &[Sidecar]) -> Result<()> {
+    for sidecar in sidecars {
+        if !image_present(docker, &sidecar.image).await? {
+            pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn await_health(docker: &Docker, container: &str, deadline: Instant) -> Result<()> {
     loop {
         let inspect = docker
             .inspect_container(container, None)
@@ -324,6 +336,7 @@ pub(crate) async fn set_running(
     }
     // Start every service before waiting: a health check may depend on
     // another service on the same network.
+    let deadline = Instant::now() + HEALTH_WAIT;
     for container in containers {
         let id = listed_id(container.id, "sidecar")?;
         let inspect = docker
@@ -336,7 +349,7 @@ pub(crate) async fn set_running(
             .and_then(|state| state.health.as_ref())
             .is_some()
         {
-            await_health(docker, &id).await?;
+            await_health(docker, &id, deadline).await?;
         }
     }
     Ok(())

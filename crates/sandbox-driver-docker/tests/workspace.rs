@@ -486,7 +486,8 @@ async fn a_paused_sandbox_refuses_one_shots() {
     sandbox.resume().await.expect("resume");
     sandbox.delete().await.expect("delete");
     assert!(
-        matches!(refused, Some(Error::Provider(_))),
+        matches!(&refused, Some(Error::Provider(error))
+            if error.message.contains("requires a running sandbox")),
         "paused sandbox admitted a one-shot: {refused:?}"
     );
     assert!(

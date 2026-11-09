@@ -203,22 +203,29 @@ impl Sandbox for DockerSandbox {
             // Whatever a one-shot was doing in the workspace ends
             // with the sandbox's own processes.
             one_shot::sweep(&self.container.docker, self.id.as_str()).await?;
-            tolerate_not_modified(
+            let requested = tolerate_not_modified(
                 self.container
                     .docker
                     .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
                     .await,
                 "stopping container",
-            )?;
-            // Stop the services even when the primary cannot be confirmed:
-            // an early return would leave every one of them running.
+            )
+            .map_err(fence::Failure::from);
+            // Stop the services even when the primary's stop fails or cannot
+            // be confirmed: an early return would leave every one of them
+            // running.
             let services = match &self.network {
                 Some(network) => {
                     sidecars::set_running(&self.container.docker, network, false).await
                 }
                 None => Ok(()),
             };
-            let primary = confirm_stopped(&self.container.docker, self.id.as_str()).await;
+            // A refused request already says the primary was not stopped;
+            // confirming would turn that definite answer into a leaked fence.
+            let primary = match requested {
+                Ok(()) => confirm_stopped(&self.container.docker, self.id.as_str()).await,
+                Err(failure) => Err(failure),
+            };
             fence::combine(primary, services)
         })
         .await
