@@ -365,6 +365,11 @@ impl SandboxProvider for DockerProvider {
             .map_err(|error| docker_error("listing containers", error))?;
         let mut statuses = Vec::new();
         for container in containers {
+            // Sidecars and one-shots carry the managed label for cleanup;
+            // they are not sandboxes.
+            if !container.labels.as_ref().is_some_and(is_primary) {
+                continue;
+            }
             let Some(id) = container.id else { continue };
             // A container deleted between list and inspect is a benign
             // race; any other inspect failure must not silently shrink
@@ -375,16 +380,6 @@ impl SandboxProvider for DockerProvider {
                 Err(Error::NotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
-            // Sidecars and one-shots carry the managed label for cleanup;
-            // they are not sandboxes.
-            let primary = inspect
-                .config
-                .as_ref()
-                .and_then(|config| config.labels.as_ref())
-                .is_some_and(is_primary);
-            if !primary {
-                continue;
-            }
             let sandbox_id = SandboxId::try_new(id)
                 .map_err(|error| Error::invalid_spec("id", error.to_string()))?;
             statuses.push(status_from_inspect(sandbox_id, &inspect));
