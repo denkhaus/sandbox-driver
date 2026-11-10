@@ -4,15 +4,15 @@
 use std::fmt::Debug;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use std::{env, fs};
 
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use sandbox_driver::contract::{Error, PluginLocation, PluginTrust, ProviderName, ProviderSchemas};
 use sandbox_driver_protocol::file_sha256;
 use sandbox_driver_protocol::metadata::{DiscoveryLimits, SchemaDiscovery, write_schema};
 use serde_json::json;
-use tokio::process::Command;
 use tokio::time;
 
 struct Fixture {
@@ -38,6 +38,18 @@ impl Fixture {
         fs::set_permissions(&self.binary, fs::Permissions::from_mode(0o700))
             .expect("executable permission");
     }
+    /// What the fixture's script appended to its `calls` file.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.root.join("calls")).expect("calls")
+    }
+    /// The process id the fixture's script wrote to its `pid` file.
+    fn pid(&self) -> i32 {
+        fs::read_to_string(self.root.join("pid"))
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number")
+    }
     fn entry(&self) -> PluginLocation {
         PluginLocation {
             entry: name(),
@@ -57,7 +69,16 @@ fn name() -> ProviderName {
     ProviderName::try_new("test-entry").expect("name")
 }
 fn schemas() -> ProviderSchemas {
-    serde_json::from_value(json!({"kind":"fixture", "version":"1.0", "config_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object"}, "secrets": ["PRIVATE_TOKEN"]})).expect("schemas")
+    serde_json::from_value(json!({
+        "kind": "fixture",
+        "version": "1.0",
+        "config_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+        },
+        "secrets": ["PRIVATE_TOKEN"],
+    }))
+    .expect("schemas")
 }
 fn emit() -> String {
     format!(
@@ -90,10 +111,7 @@ async fn probe_is_credential_free_and_cache_is_shared_by_digest() {
     renamed.path = Some(copy.to_string_lossy().into());
     let second = cache.discover(&renamed).await.expect("cached schema");
     assert_eq!(second.digest(), first.digest());
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("calls")).expect("calls"),
-        "probe\n"
-    );
+    assert_eq!(fixture.calls(), "probe\n");
 }
 
 #[tokio::test]
@@ -130,11 +148,7 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
         .verify_unchanged(&name())
         .await
         .expect_err("cannot launch changed binary");
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("calls")).expect("calls"),
-        "probe\n",
-        "bad pin never executes"
-    );
+    assert_eq!(fixture.calls(), "probe\n", "bad pin never executes");
     let changed = cache
         .discover(&fixture.entry())
         .await
@@ -222,16 +236,9 @@ async fn wait_for_file(path: &Path) {
     .await
     .expect("probe started");
 }
-async fn assert_dead(pid: u32) {
+async fn assert_dead(pid: i32) {
     time::timeout(Duration::from_secs(3), async {
-        while Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .expect("check process")
-            .success()
-        {
+        while kill(Pid::from_raw(pid), None).is_ok() {
             time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -248,21 +255,13 @@ async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
     })
     .expect("limits");
     cache.discover(&fixture.entry()).await.expect_err("timeout");
-    let pid = fs::read_to_string(fixture.root.join("pid"))
-        .expect("pid")
-        .trim()
-        .parse()
-        .expect("pid number");
+    let pid = fixture.pid();
     assert_dead(pid).await;
     fs::remove_file(fixture.root.join("pid")).expect("remove pid");
     let entry = fixture.entry();
     let task = tokio::spawn(async move { SchemaDiscovery::default().discover(&entry).await });
     wait_for_file(&fixture.root.join("pid")).await;
-    let pid = fs::read_to_string(fixture.root.join("pid"))
-        .expect("pid")
-        .trim()
-        .parse()
-        .expect("pid number");
+    let pid = fixture.pid();
     task.abort();
     assert!(task.await.expect_err("cancelled").is_cancelled());
     assert_dead(pid).await;
@@ -288,11 +287,7 @@ async fn concurrent_discoveries_wait_and_share_one_probe() {
     for result in [results.0, results.1, results.2, results.3, results.4] {
         result.expect("capacity waits instead of refusing");
     }
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("calls")).expect("calls"),
-        "probe\n",
-        "one probe per binary"
-    );
+    assert_eq!(fixture.calls(), "probe\n", "one probe per binary");
 }
 
 #[tokio::test]
@@ -307,10 +302,7 @@ async fn cache_storage_is_bounded() {
     cache.discover(&first.entry()).await.expect("first");
     cache.discover(&second.entry()).await.expect("evicts first");
     cache.discover(&first.entry()).await.expect("probes again");
-    assert_eq!(
-        fs::read_to_string(first.root.join("calls")).expect("calls"),
-        "probe\nprobe\n"
-    );
+    assert_eq!(first.calls(), "probe\nprobe\n");
 }
 
 #[tokio::test]
@@ -331,11 +323,7 @@ async fn descendants_of_a_probe_are_killed_with_it() {
         })
         .expect("limits");
         let _ = cache.discover(&fixture.entry()).await;
-        let pid = fs::read_to_string(fixture.root.join("pid"))
-            .expect("pid")
-            .trim()
-            .parse()
-            .expect("pid number");
+        let pid = fixture.pid();
         assert_dead(pid).await;
     }
 }

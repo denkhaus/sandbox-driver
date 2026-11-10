@@ -6,7 +6,7 @@
 //! replacement: the executable is hashed, then executed by path. The digest
 //! covers the executable, not an interpreter or its dependencies.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,7 +26,7 @@ use tokio::process::Command;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::{fs, time};
 
-use crate::discovery::file_sha256;
+use crate::discovery::{file_sha256, is_executable};
 
 /// Budgets shared by all probes using one discovery cache.
 #[derive(Clone, Debug)]
@@ -63,13 +63,8 @@ type Probe = Arc<OnceCell<Arc<ProviderSchemas>>>;
 pub struct SchemaDiscovery {
     limits: DiscoveryLimits,
     probes: Semaphore,
-    cache:  Mutex<Cache>,
-}
-
-#[derive(Default)]
-struct Cache {
-    entries: BTreeMap<Sha256Digest, Probe>,
-    order:   VecDeque<Sha256Digest>,
+    /// Oldest first.
+    cache:  Mutex<VecDeque<(Sha256Digest, Probe)>>,
 }
 
 impl Default for SchemaDiscovery {
@@ -97,14 +92,14 @@ impl SchemaDiscovery {
         Ok(Self {
             probes: Semaphore::new(limits.concurrent_probes),
             limits,
-            cache: Mutex::new(Cache::default()),
+            cache: Mutex::default(),
         })
     }
 
     /// Resolves only the selected location. The probe receives exactly
-    /// `--describe-schema`, null stdin, `/` as its working directory, a
-    /// platform-only environment, and no entry config, arguments,
-    /// explicit/inherited environment, or secrets. It runs in its own process
+    /// `--describe-schema`, null stdin, a platform-only environment, and no
+    /// entry config, arguments, explicit/inherited environment, or secrets.
+    /// On Unix its working directory is `/` and it runs in its own process
     /// group, which is killed when the probe ends, fails or is cancelled.
     pub async fn discover(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
         time::timeout(self.limits.timeout, self.discover_inner(location))
@@ -122,7 +117,7 @@ impl SchemaDiscovery {
             )
         })?;
         let path = resolve(location).await?;
-        let digest = digest(entry, &path).await?;
+        let digest = executable_digest(entry, &path).await?;
         if let PluginTrust::Sha256 { digest: expected } = trust {
             if expected != &digest {
                 return Err(invalid_config(
@@ -138,15 +133,17 @@ impl SchemaDiscovery {
         let cell = self.cell(&digest);
         let schemas = cell
             .get_or_try_init(|| async {
-                let _permit = self
-                    .probes
-                    .acquire()
-                    .await
-                    .expect("the probe semaphore is never closed");
-                let schemas = probe(entry, &path, &self.limits).await?;
+                let schemas = {
+                    let _permit = self
+                        .probes
+                        .acquire()
+                        .await
+                        .expect("the probe semaphore is never closed");
+                    probe(entry, &path, &self.limits).await?
+                };
                 // A replacement during the probe must not be cached under
                 // the digest that was trusted.
-                if self::digest(entry, &path).await? != digest {
+                if executable_digest(entry, &path).await? != digest {
                     return Err(invalid_config(
                         entry,
                         "path",
@@ -179,18 +176,14 @@ impl SchemaDiscovery {
     /// beyond the cache budget; a caller already waiting keeps its slot.
     fn cell(&self, digest: &Sha256Digest) -> Probe {
         let mut cache = self.cache.lock().expect("metadata cache lock");
-        if let Some(cell) = cache.entries.get(digest) {
+        if let Some((_, cell)) = cache.iter().find(|(cached, _)| cached == digest) {
             return Arc::clone(cell);
         }
-        while cache.entries.len() >= self.limits.cached_binaries {
-            let Some(oldest) = cache.order.pop_front() else {
-                break;
-            };
-            cache.entries.remove(&oldest);
+        if cache.len() >= self.limits.cached_binaries {
+            cache.pop_front();
         }
         let cell = Probe::default();
-        cache.entries.insert(digest.clone(), Arc::clone(&cell));
-        cache.order.push_back(digest.clone());
+        cache.push_back((digest.clone(), Arc::clone(&cell)));
         cell
     }
 }
@@ -225,7 +218,7 @@ impl DiscoveredPlugin {
     /// Recheck immediately before runtime launch. A replacement must go
     /// through discovery and trust verification again, even in development.
     pub async fn verify_unchanged(&self, entry: &ProviderName) -> Result<(), Error> {
-        if digest(entry, &self.path).await? != self.digest {
+        if executable_digest(entry, &self.path).await? != self.digest {
             return Err(invalid_config(
                 entry,
                 "path",
@@ -271,17 +264,13 @@ async fn resolve(location: &PluginLocation) -> Result<PathBuf, Error> {
     if !metadata.is_file() {
         return Err(missing("is not a file"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(missing("is not executable"));
-        }
+    if !is_executable(&metadata) {
+        return Err(missing("is not executable"));
     }
     Ok(path)
 }
 
-async fn digest(entry: &ProviderName, path: &Path) -> Result<Sha256Digest, Error> {
+async fn executable_digest(entry: &ProviderName, path: &Path) -> Result<Sha256Digest, Error> {
     let hash = file_sha256(path)
         .await
         .map_err(|_| unavailable(entry, "cannot read plugin executable"))?;
@@ -368,27 +357,24 @@ impl Drop for ProcessGroup {
 
 async fn read_bounded(
     entry: &ProviderName,
-    mut reader: impl AsyncRead + Unpin,
+    reader: impl AsyncRead + Unpin,
     max: usize,
 ) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    let mut buffer = vec![0; 8192];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|_| unavailable(entry, "cannot read metadata probe output"))?;
-        if count == 0 {
-            return Ok(bytes);
-        }
-        if count > max.saturating_sub(bytes.len()) {
-            return Err(unavailable(
-                entry,
-                "plugin metadata probe output exceeded its budget",
-            ));
-        }
-        bytes.extend_from_slice(&buffer[..count]);
+    // One byte past the budget is enough to tell an oversize output apart.
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    reader
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| unavailable(entry, "cannot read metadata probe output"))?;
+    if bytes.len() > max {
+        return Err(unavailable(
+            entry,
+            "plugin metadata probe output exceeded its budget",
+        ));
     }
+    Ok(bytes)
 }
 
 /// SDK helper for `--describe-schema`. Call before constructing a provider or
