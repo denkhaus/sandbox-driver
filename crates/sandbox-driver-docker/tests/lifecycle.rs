@@ -417,7 +417,14 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
             if request.contains("one-shot") {
                 (200, json!([]))
             } else {
-                (200, json!([{"Id": "main"}]))
+                (
+                    200,
+                    json!([{"Id": "main", "Labels": {
+                        "sh.sandbox-driver.managed": "true",
+                        "sh.sandbox-driver.sidecar-network": "example-net",
+                        "petri.workspace": "test/work"
+                    }}]),
+                )
             }
         } else if request.contains("/containers/main/json") {
             (

@@ -219,8 +219,7 @@ async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Opti
         .image
         .as_deref()
         .ok_or_else(|| Error::Transport(TransportError::new("daemon omitted the sandbox image")))?;
-    let name = label_of(&inspect, FENCE_NAME_LABEL)
-        .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned);
+    let name = fence_name(&inspect, id);
     // Keep the name on the claim: the primary may disappear before release,
     // after which Docker can no longer resolve that name to its canonical ID.
     let sandbox_name = inspect
@@ -261,9 +260,7 @@ pub(crate) async fn draining(docker: &Docker, primary: &ContainerInspectResponse
     let Some(id) = primary.id.as_deref() else {
         return Ok(false);
     };
-    let name = label_of(primary, FENCE_NAME_LABEL)
-        .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned);
-    match discover(docker, id, &name).await {
+    match discover(docker, id, &fence_name(primary, id)).await {
         Ok(marker) => Ok(matches!(
             label_of(&marker, OPERATION_LABEL),
             Some(label) if label == Operation::Stop.label() || label == Operation::Delete.label()
@@ -271,6 +268,13 @@ pub(crate) async fn draining(docker: &Docker, primary: &ContainerInspectResponse
         Err(Error::NotFound { .. }) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// The name of the inspected primary's fence marker: the one recorded at
+/// create, or the name sandboxes created before that was recorded use.
+fn fence_name(primary: &ContainerInspectResponse, id: &str) -> String {
+    label_of(primary, FENCE_NAME_LABEL)
+        .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned)
 }
 
 /// Allocates the gate before the primary is visible to attach/list. Its name

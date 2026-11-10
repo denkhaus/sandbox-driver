@@ -14,7 +14,8 @@ use sandbox_driver::contract::{ByteStream, Error as ContractError, MutationOutco
 use sandbox_driver::{Error, Filesystem};
 use tokio::fs::{self as tokio_fs, File, OpenOptions};
 use tokio::io::{
-    self as tokio_io, AsyncRead, AsyncSeekExt, AsyncWrite, DuplexStream, ReadBuf, duplex,
+    self as tokio_io, AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufWriter, DuplexStream,
+    ReadBuf, duplex,
 };
 use tokio::sync::oneshot;
 
@@ -22,6 +23,7 @@ use super::error::to_contract;
 use crate::sandbox::DockerSandbox;
 
 const PIPE_BYTES: usize = 64 * 1024;
+const SPOOL_WRITE_BYTES: usize = 1024 * 1024;
 
 /// Streams `path` from the sandbox. Failures before the first byte (a
 /// missing file, say) are returned here; later ones fail the stream, so a
@@ -84,7 +86,11 @@ pub(super) async fn write(
     let removed = tokio_fs::remove_file(&location).await;
     let copied = async {
         removed?;
-        let length = tokio_io::copy(&mut bytes, &mut spool).await?;
+        // Each write to a tokio `File` is a blocking-pool round trip, so
+        // batch them rather than writing `copy`'s 8 KiB chunks one by one.
+        let mut buffered = BufWriter::with_capacity(SPOOL_WRITE_BYTES, &mut spool);
+        let length = tokio_io::copy(&mut bytes, &mut buffered).await?;
+        buffered.flush().await?;
         spool.rewind().await?;
         Ok::<_, io::Error>(length)
     }

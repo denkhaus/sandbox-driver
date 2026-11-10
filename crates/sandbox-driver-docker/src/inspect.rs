@@ -84,7 +84,12 @@ pub(crate) fn map_state(inspect: &ContainerInspectResponse) -> SandboxState {
     if state.paused == Some(true) {
         return SandboxState::Paused;
     }
-    match state.status {
+    map_status(state.status)
+}
+
+/// A Docker container status as a sandbox state.
+pub(crate) fn map_status(status: Option<ContainerStateStatusEnum>) -> SandboxState {
+    match status {
         Some(ContainerStateStatusEnum::RUNNING) => SandboxState::Running,
         Some(ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EXITED) => {
             SandboxState::Stopped

@@ -18,13 +18,14 @@ mod spec;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bollard::container::ListContainersOptions;
+use bollard::models::ContainerInspectResponse;
 use bollard::{API_DEFAULT_VERSION, Docker};
 use sandbox_driver::contract::{
     AccessScope, Activation, ByteStream, CapabilitySet, ContainerField, Containers, Descriptor,
@@ -44,9 +45,8 @@ use serde::Deserialize;
 use tokio::time;
 
 pub(crate) use self::error::to_contract;
-use crate::container::inspect_container;
 use crate::daemon::{POSIX_SH, docker_error, docker_kind};
-use crate::inspect::{caller_labels, is_primary, map_state};
+use crate::inspect::{caller_labels, is_primary, map_state, map_status, normalized_container_name};
 use crate::provider::DockerProvider;
 use crate::sandbox::DockerSandbox;
 use crate::{MANAGED_LABEL, fence, sidecars};
@@ -196,7 +196,6 @@ impl DockerRuntime {
                 namespace,
                 id: inner.id.clone(),
             },
-            working_directory: PathBuf::from(&inner.container.working_dir),
             inner,
         })
     }
@@ -245,15 +244,12 @@ impl ProviderRuntime for DockerRuntime {
     }
 
     async fn health(&self) -> Result<Health, ContractError> {
-        Ok(match self.docker.ping().await {
-            Ok(_) => Health {
-                healthy: true,
-                message: None,
-            },
-            Err(error) => Health {
-                healthy: false,
-                message: Some(format!("pinging the docker daemon failed: {error}")),
-            },
+        let health = SandboxProvider::health(&self.provider)
+            .await
+            .map_err(to_contract)?;
+        Ok(Health {
+            healthy: health.status == legacy::HealthStatus::Ok,
+            message: health.message,
         })
     }
 
@@ -322,10 +318,13 @@ impl ProviderRuntime for DockerRuntime {
                         }
                     })?,
                 },
-                name: container
-                    .names
-                    .and_then(|names| names.into_iter().next())
-                    .map(|name| name.trim_start_matches('/').to_owned()),
+                name: normalized_container_name(
+                    container
+                        .names
+                        .as_ref()
+                        .and_then(|names| names.first())
+                        .map(String::as_str),
+                ),
                 state: listed_state(container.state.as_deref()),
                 labels,
             });
@@ -344,16 +343,19 @@ impl ProviderRuntime for DockerRuntime {
     }
 }
 
+/// A listed container's state, through the same table as `status`.
 fn listed_state(state: Option<&str>) -> SandboxState {
-    match state {
-        Some("running") => SandboxState::Running,
-        Some("created" | "exited") => SandboxState::Stopped,
-        Some("paused") => SandboxState::Paused,
-        Some("restarting") => SandboxState::Starting,
-        Some("removing") => SandboxState::Deleting,
-        Some("dead") => SandboxState::Unhealthy,
-        _ => SandboxState::Unknown,
-    }
+    contract_state(map_status(state.and_then(|state| state.parse().ok())))
+}
+
+/// When the inspected container's current run started, or `None` when it is
+/// not running. Every process in the workload belongs to one run.
+fn current_run(inspect: &ContainerInspectResponse) -> Option<&str> {
+    inspect
+        .state
+        .as_ref()
+        .filter(|state| state.running == Some(true))
+        .and_then(|state| state.started_at.as_deref())
 }
 
 fn contract_state(state: legacy::SandboxState) -> SandboxState {
@@ -370,9 +372,8 @@ fn contract_state(state: legacy::SandboxState) -> SandboxState {
 
 /// A Docker sandbox through the shared contract.
 struct DockerContractSandbox {
-    reference:         SandboxRef,
-    working_directory: PathBuf,
-    inner:             Arc<DockerSandbox>,
+    reference: SandboxRef,
+    inner:     Arc<DockerSandbox>,
 }
 
 impl DockerContractSandbox {
@@ -380,10 +381,7 @@ impl DockerContractSandbox {
     /// is not running. Every process in the workload belongs to one run.
     async fn run_started(&self) -> Result<Option<String>, ContractError> {
         let inspect = self.inner.container.inspect().await.map_err(to_contract)?;
-        Ok(inspect
-            .state
-            .filter(|state| state.running == Some(true))
-            .and_then(|state| state.started_at))
+        Ok(current_run(&inspect).map(str::to_owned))
     }
 
     /// Whether the container run a command was admitted into is over, which
@@ -394,12 +392,7 @@ impl DockerContractSandbox {
         let deadline = Instant::now() + DRAIN_WAIT;
         loop {
             let inspect = self.inner.container.inspect().await.map_err(to_contract)?;
-            let current = inspect
-                .state
-                .as_ref()
-                .filter(|state| state.running == Some(true))
-                .and_then(|state| state.started_at.as_deref());
-            if current != Some(admitted) {
+            if current_run(&inspect) != Some(admitted) {
                 return Ok(true);
             }
             let draining = fence::draining(&self.inner.container.docker, &inspect)
@@ -525,7 +518,7 @@ impl Sandbox for DockerContractSandbox {
     }
 
     fn working_directory(&self) -> &Path {
-        &self.working_directory
+        Path::new(&self.inner.container.working_dir)
     }
 
     fn env(&self) -> &BTreeMap<String, String> {
@@ -533,9 +526,7 @@ impl Sandbox for DockerContractSandbox {
     }
 
     async fn status(&self) -> Result<Status, ContractError> {
-        let inspect = inspect_container(&self.inner.container.docker, self.inner.id.as_str())
-            .await
-            .map_err(to_contract)?;
+        let inspect = self.inner.container.inspect().await.map_err(to_contract)?;
         let host = inspect.host_config.as_ref();
         let resources = Resources {
             cpu_cores: host
@@ -793,25 +784,23 @@ impl Ports for DockerContractSandbox {
 #[async_trait]
 impl Lifecycle for DockerContractSandbox {
     async fn apply(&self, action: LifecycleCapability) -> Result<(), ContractError> {
-        let result = match action {
-            LifecycleCapability::Pause => legacy::Sandbox::pause(self.inner.as_ref()).await,
-            LifecycleCapability::Resume => legacy::Sandbox::resume(self.inner.as_ref()).await,
-            other => {
-                return Err(ContractError::Unsupported {
-                    capability: format!("lifecycle.{}", lifecycle_name(other)),
-                });
+        let capability = match action {
+            LifecycleCapability::Pause => {
+                return legacy::Sandbox::pause(self.inner.as_ref())
+                    .await
+                    .map_err(to_contract);
             }
+            LifecycleCapability::Resume => {
+                return legacy::Sandbox::resume(self.inner.as_ref())
+                    .await
+                    .map_err(to_contract);
+            }
+            LifecycleCapability::Archive => "lifecycle.archive",
+            LifecycleCapability::Recover => "lifecycle.recover",
         };
-        result.map_err(to_contract)
-    }
-}
-
-fn lifecycle_name(action: LifecycleCapability) -> &'static str {
-    match action {
-        LifecycleCapability::Pause => "pause",
-        LifecycleCapability::Resume => "resume",
-        LifecycleCapability::Archive => "archive",
-        LifecycleCapability::Recover => "recover",
+        Err(ContractError::Unsupported {
+            capability: capability.to_owned(),
+        })
     }
 }
 
@@ -866,8 +855,7 @@ impl Containers for DockerContractSandbox {
                 reuse,
             },
         };
-        let mut legacy_spec = legacy::OneShotSpec::registry("");
-        legacy_spec.image = image;
+        let mut legacy_spec = legacy::OneShotSpec::new(image);
         legacy_spec.entrypoint = spec.entrypoint;
         legacy_spec.args = spec.args;
         legacy_spec.env = spec.env;
@@ -878,12 +866,10 @@ impl Containers for DockerContractSandbox {
             .one_shot
             .as_ref()
             .expect("containers() offers one-shots only with a workspace");
-        let result = self
-            .streamed(controls, |controls| async move {
-                one_shot.run(&legacy_spec, controls).await
-            })
-            .await?;
-        Ok(result)
+        self.streamed(controls, |controls| async move {
+            one_shot.run(&legacy_spec, controls).await
+        })
+        .await
     }
 }
 

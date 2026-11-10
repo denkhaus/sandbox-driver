@@ -165,8 +165,7 @@ pub(crate) fn plan(
         .iter()
         .map(|(name, service)| translate_service(name, service, credentials))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut plan =
-        ContainerPlan::plan(&legacy_spec, services).map_err(runtime::error::to_contract)?;
+    let mut plan = ContainerPlan::plan(&legacy_spec, services).map_err(runtime::to_contract)?;
     let host = plan
         .config
         .host_config
@@ -190,7 +189,6 @@ fn provider_config(options: DockerSpecOptions, container: &ContainerSpec) -> Doc
     let defaults = DockerProviderConfig::default();
     DockerProviderConfig {
         auto_pull: options.auto_pull.unwrap_or(defaults.auto_pull),
-        init: container.init.unwrap_or(false),
         privileged: container.privileged.unwrap_or(false),
         // The legacy plan refuses host networking beside services.
         host_network: options.host_network,
@@ -281,12 +279,13 @@ fn readiness(
                 .to_owned(),
         });
     }
-    if deadline > HEALTH_WAIT || deadline > fence::PROVISIONING_WORK {
+    let limit = HEALTH_WAIT.min(fence::PROVISIONING_WORK);
+    if deadline > limit {
         return Err(Error::InvalidSpec {
             path:    format!("{path}.ready.deadline_ms"),
             message: format!(
                 "docker waits at most {} ms for service readiness",
-                HEALTH_WAIT.as_millis()
+                limit.as_millis()
             ),
         });
     }
