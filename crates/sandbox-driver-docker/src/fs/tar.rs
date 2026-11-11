@@ -323,6 +323,17 @@ pub(crate) fn reroot(archive: &[u8]) -> Result<Vec<u8>> {
             continue;
         }
         let mut header = entry.header().clone();
+        // A cloned header can carry the source archive's USTAR path
+        // split (prefix + name; the daemon's archive API splits paths
+        // over 100 bytes). append_data's set_path writes only the name
+        // field when the re-rooted path fits in it, so a stale prefix
+        // would ship the entry under old-prefix + new-name — a doubled
+        // path no build-context reader finds, silently dropping the
+        // file from the image (work#1253). Clear the split so the
+        // builder owns the whole path.
+        if let Some(ustar) = header.as_ustar_mut() {
+            ustar.prefix = [0; 155];
+        }
         if header.entry_type().is_dir() {
             builder
                 .append_data(&mut header, rest, io::empty())
@@ -603,6 +614,45 @@ mod tests {
             })
             .collect();
         assert_eq!(paths, ["Dockerfile"]);
+    }
+
+    #[test]
+    fn re_rooting_replaces_a_split_ustar_path_completely() {
+        // The daemon's archive API splits an entry path longer than the
+        // 100-byte name field across the USTAR prefix and name fields.
+        // Re-rooting must replace that path wholesale: a cloned header
+        // keeps the old prefix, and append_data's set_path writes only
+        // the name field when the re-rooted path fits in it — the entry
+        // would ship under old-prefix + new-name, a doubled path no
+        // build-context reader finds. This is the work#1253 cook
+        // failure: every context file with a holder path over 100 bytes
+        // silently vanished from the built image.
+        let holder_path = "petri-env-context/lib/foundation/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs";
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        header.set_size(4);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, holder_path, Cursor::new(b"FROM"))
+            .expect("file");
+        let archive = builder.into_inner().expect("tar");
+        let rerooted = reroot(&archive).expect("re-root");
+        let mut archive = tar::Archive::new(Cursor::new(rerooted));
+        let paths: Vec<String> = archive
+            .entries()
+            .expect("entries")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(paths, [
+            "lib/foundation/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs"
+        ]);
     }
 
     #[test]
