@@ -137,7 +137,11 @@ impl DockerOneShot {
         // Fork feature (work#1253): the daemon's streamed output and the
         // cause chain of a stream-level failure must survive into the
         // error message — a flattened `docker error: building image`
-        // names nothing.
+        // names nothing. The chain is interpolated into the message AND
+        // kept as the error's source: `ProviderError`'s `Display`
+        // renders no chain, so the interpolation is the only render a
+        // JSON-RPC consumer sees (a deliberate deviation from the
+        // no-flattening guideline, documented here at the bend).
         let mut tail = BuildOutputTail::new();
         while let Some(info) = build.next().await {
             let info = info.map_err(|error| {
