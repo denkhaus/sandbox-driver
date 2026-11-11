@@ -36,6 +36,7 @@ use sandbox_driver::{
 };
 use tokio::time;
 
+use crate::build_diagnostics::{BuildOutputTail, render_api_failure, with_output_tail};
 use crate::container::{ContainerRef, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::fs::tar::reroot;
@@ -133,11 +134,27 @@ impl DockerOneShot {
             .container
             .docker
             .build_image(options, None, Some(context_tar.into()));
+        // Fork feature (work#1253): the daemon's streamed output and the
+        // cause chain of a stream-level failure must survive into the
+        // error message — a flattened `docker error: building image`
+        // names nothing.
+        let mut tail = BuildOutputTail::new();
         while let Some(info) = build.next().await {
-            let info = info.map_err(|error| docker_error("building image", error))?;
+            let info = info.map_err(|error| {
+                let chain = render_api_failure(&error);
+                docker_error(
+                    &with_output_tail(format!("building image: {chain}"), &tail),
+                    error,
+                )
+            })?;
+            if let Some(line) = info.stream {
+                tail.record(line);
+            }
             if let Some(message) = info.error {
-                let mut provider =
-                    ProviderError::new(docker_kind(), format!("image build failed: {message}"));
+                let mut provider = ProviderError::new(
+                    docker_kind(),
+                    with_output_tail(format!("image build failed: {message}"), &tail),
+                );
                 provider.code = Some("build".to_owned());
                 return Err(Error::Provider(provider));
             }

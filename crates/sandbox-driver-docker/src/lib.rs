@@ -49,6 +49,7 @@
 //! restarts.
 
 mod access;
+mod build_diagnostics;
 mod config;
 mod container;
 mod create;
