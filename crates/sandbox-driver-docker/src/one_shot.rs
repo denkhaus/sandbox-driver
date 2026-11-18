@@ -27,7 +27,7 @@ use bollard::container::{
     WaitContainerOptions,
 };
 use bollard::errors::Error as DockerApiError;
-use bollard::image::BuildImageOptions;
+use bollard::image::{BuildImageOptions, RemoveImageOptions};
 use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
@@ -410,6 +410,62 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
 
 #[async_trait]
 impl OneShot for DockerOneShot {
+    /// Fork feature (work#1440): mint-time eviction of cooked
+    /// environment images. Lists the daemon's images, keeps the `keep`
+    /// newest whose reference carries `prefix`, force-removes the rest,
+    /// and returns the evicted references. One image's removal failure
+    /// never aborts the sweep: it is logged and the sweep continues —
+    /// the ceiling is a backstop, not a transaction.
+    async fn evict_lru_images(&self, prefix: &str, keep: usize) -> Result<Vec<String>> {
+        let images = self
+            .container
+            .docker
+            .list_images::<String>(None)
+            .await
+            .map_err(|error| docker_error("listing images for eviction", error))?;
+        // Only the daemon's final-layer listing is consulted, and only
+        // the FIRST matching reference per image: an image carrying two
+        // matching tags is still one image, evicted once.
+        let mut tagged: Vec<(i64, String)> = images
+            .into_iter()
+            .filter_map(|image| {
+                let reference = image
+                    .repo_tags
+                    .iter()
+                    .find(|tag| tag.starts_with(prefix))?
+                    .clone();
+                Some((image.created, reference))
+            })
+            .collect();
+        // Newest first; the reference breaks ties so the sweep is
+        // deterministic across daemons with coarse creation stamps.
+        tagged.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut evicted = Vec::new();
+        for (_, reference) in tagged.into_iter().skip(keep) {
+            let removal = self
+                .container
+                .docker
+                .remove_image(
+                    &reference,
+                    Some(RemoveImageOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .await;
+            match removal {
+                Ok(_) => evicted.push(reference.clone()),
+                Err(problem) => tracing::warn!(
+                    %reference,
+                    %problem,
+                    "evicting an environment image failed"
+                ),
+            }
+        }
+        Ok(evicted)
+    }
+
     #[tracing::instrument(
         skip_all,
         fields(provider_kind = "docker", sandbox_id = %self.container.id),

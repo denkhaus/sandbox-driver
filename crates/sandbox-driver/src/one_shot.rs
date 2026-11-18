@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::capabilities::Capability;
+use crate::error::{Error, Result};
 use crate::exec::{ExecControls, ExecStreamingResult};
 use crate::sanitize::OutputSanitization;
 
@@ -33,6 +34,20 @@ pub trait OneShot: Send + Sync {
     /// Pulls or builds the image as needed, runs the container to
     /// completion, and removes it.
     async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult>;
+
+    /// Evicts images whose reference carries `prefix`, keeping the
+    /// `keep` newest by the daemon's creation time, and returns the
+    /// evicted references. Fork feature (work#1440): the mint-time
+    /// ceiling for cooked environment images — creation-time ordering
+    /// on the daemon side bounds the population even across process
+    /// restarts, which no in-process ledger can. Providers without
+    /// image-listing access to their daemon return
+    /// [`Error::Unsupported`]; callers treat that as a skipped sweep,
+    /// never as a failure of the cook.
+    async fn evict_lru_images(&self, prefix: &str, keep: usize) -> Result<Vec<String>> {
+        let _ = (prefix, keep);
+        Err(Error::unsupported(Capability::OneShot))
+    }
 }
 
 /// Where a one-shot container's image comes from.
