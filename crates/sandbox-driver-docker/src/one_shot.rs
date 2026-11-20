@@ -410,6 +410,13 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
 
 #[async_trait]
 impl OneShot for DockerOneShot {
+    /// Fork feature (work#1463): the cross-process presence probe. The
+    /// daemon is the shared truth between per-process cooks; a hit means
+    /// another process already cooked the tag and this cook reuses it.
+    async fn image_present(&self, reference: &str) -> Result<bool> {
+        image_present(&self.container.docker, reference).await
+    }
+
     /// Fork feature (work#1440): mint-time eviction of cooked
     /// environment images. Lists the daemon's images, keeps the `keep`
     /// newest whose reference carries `prefix`, force-removes the rest,

@@ -148,6 +148,12 @@ impl NestedDocker {
 
 #[async_trait]
 impl OneShot for NestedDocker {
+    /// Fork feature (work#1463): the cross-process presence probe over
+    /// the nested `docker image inspect`.
+    async fn image_present(&self, reference: &str) -> Result<bool> {
+        self.cli.image_present(reference).await
+    }
+
     async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let deadline = async {

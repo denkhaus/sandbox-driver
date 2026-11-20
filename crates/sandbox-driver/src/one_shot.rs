@@ -48,6 +48,19 @@ pub trait OneShot: Send + Sync {
         let _ = (prefix, keep);
         Err(Error::unsupported(Capability::OneShot))
     }
+
+    /// Whether the daemon already holds `reference`. Fork feature
+    /// (work#1463): the environment-image cooks run one process per
+    /// gear, so no in-process single-flight registry sees another
+    /// process's cook — the daemon's image set is the shared truth. A
+    /// presence hit lets a cook reuse the image without building.
+    /// Providers without image-inspect access to their daemon return
+    /// [`Error::Unsupported`]; callers treat that as "absent" and
+    /// build (fail-open — a duplicate build, never a stuck cook).
+    async fn image_present(&self, reference: &str) -> Result<bool> {
+        let _ = reference;
+        Err(Error::unsupported(Capability::OneShot))
+    }
 }
 
 /// Where a one-shot container's image comes from.
