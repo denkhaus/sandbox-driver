@@ -417,6 +417,34 @@ impl OneShot for DockerOneShot {
         image_present(&self.container.docker, reference).await
     }
 
+    /// Fork feature (work#1551): the newest cooked environment image,
+    /// by the same creation-time ordering the eviction sweep keeps —
+    /// the reference breaks ties so the sweep's newest kept image and
+    /// this answer agree on daemons with coarse creation stamps.
+    async fn newest_image(&self, prefix: &str) -> Result<Option<String>> {
+        let images = self
+            .container
+            .docker
+            .list_images::<String>(None)
+            .await
+            .map_err(|error| docker_error("listing images for the newest lookup", error))?;
+        // Only the FIRST matching reference per image, exactly as the
+        // eviction sweep reads the listing.
+        let mut tagged: Vec<(i64, String)> = images
+            .into_iter()
+            .filter_map(|image| {
+                let reference = image
+                    .repo_tags
+                    .iter()
+                    .find(|tag| tag.starts_with(prefix))?
+                    .clone();
+                Some((image.created, reference))
+            })
+            .collect();
+        tagged.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(tagged.into_iter().next().map(|(_, reference)| reference))
+    }
+
     /// Fork feature (work#1440): mint-time eviction of cooked
     /// environment images. Lists the daemon's images, keeps the `keep`
     /// newest whose reference carries `prefix`, force-removes the rest,

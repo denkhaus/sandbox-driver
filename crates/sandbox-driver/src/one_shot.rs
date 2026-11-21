@@ -61,6 +61,23 @@ pub trait OneShot: Send + Sync {
         let _ = reference;
         Err(Error::unsupported(Capability::OneShot))
     }
+
+    /// The newest image reference carrying `prefix`, when the daemon
+    /// holds one. Fork feature (work#1551): the environment cook's
+    /// recipe digest runs `cargo chef prepare` in the newest existing
+    /// cooked environment image — busybox (the cook's holder) has no
+    /// cargo, while every cooked `petri-env-*` image carries cargo and
+    /// cargo-chef (circular, but valid: prepare only parses manifests).
+    /// A digest over the prepare output makes a source-only merge mint
+    /// the SAME tag, which a whole-tree digest never did. Providers
+    /// without image-listing access to their daemon return
+    /// [`Error::Unsupported`]; the caller falls back to the whole-tree
+    /// digest — a daemon with no cooked image has nothing to prepare in
+    /// anyway (the bootstrap case).
+    async fn newest_image(&self, prefix: &str) -> Result<Option<String>> {
+        let _ = prefix;
+        Err(Error::unsupported(Capability::OneShot))
+    }
 }
 
 /// Where a one-shot container's image comes from.
